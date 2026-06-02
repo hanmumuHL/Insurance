@@ -32,14 +32,11 @@ Orchestrator — 多 Agent 调度中心
 """
 
 import time
-from dataclasses import asdict
-from typing import Optional
 
-from base.logger import logger
-from base.llm_client import get_llm_client
-from agent.state import SubAgentTask, OrchestratorState
+from agent.state import SubAgentTask
 from agent.sub_agents.base import SubAgentResult
-
+from base.llm_client import get_llm_client
+from base.logger import logger
 
 # ================================================================
 # 意图 → Agent 路由表
@@ -73,7 +70,6 @@ INTENT_ROUTING = {
         "mode": "multi_agent",
         "description": "投保引导 + 核保审核",
     },
-
     # ── 核保相关 → 核保 Agent ──
     "核保咨询": {
         "primary": "underwriting",
@@ -81,7 +77,6 @@ INTENT_ROUTING = {
         "mode": "single_agent",
         "description": "健康告知/核保规则/风险评估",
     },
-
     # ── 理赔相关 → 理赔 Agent (+ 核保 Agent 辅助) ──
     "理赔咨询": {
         "primary": "claim",
@@ -101,7 +96,6 @@ INTENT_ROUTING = {
         "mode": "single_agent",
         "description": "条款原文检索与解释",
     },
-
     # ── 客服相关 → 客服 Agent ──
     "保单查询": {
         "primary": "service",
@@ -109,7 +103,6 @@ INTENT_ROUTING = {
         "mode": "single_agent",
         "description": "查询保单状态/保障信息",
     },
-
     # ── 降级场景 → 不走 Agent ──
     "投诉建议": {
         "primary": "service",
@@ -160,9 +153,13 @@ class Orchestrator:
             primary = route["primary"]
             secondary = route.get("secondary")
             if primary not in registered:
-                logger.warning(f"[Orchestrator] 路由表引用未注册 Agent: '{primary}' (意图: {intent})")
+                logger.warning(
+                    f"[Orchestrator] 路由表引用未注册 Agent: '{primary}' (意图: {intent})"
+                )
             if secondary and secondary not in registered:
-                logger.warning(f"[Orchestrator] 路由表引用未注册 Agent: '{secondary}' (意图: {intent})")
+                logger.warning(
+                    f"[Orchestrator] 路由表引用未注册 Agent: '{secondary}' (意图: {intent})"
+                )
 
     # ================================================================
     # 主入口
@@ -221,7 +218,9 @@ class Orchestrator:
 
         # ── Step 3: 构建任务列表 ──
         t2 = time.time()
-        tasks = self._build_tasks(query, intent, entities or {}, route, user_profile or {})
+        tasks = self._build_tasks(
+            query, intent, entities or {}, route, user_profile or {}
+        )
         pipeline["task_build"] = round((time.time() - t2) * 1000, 1)
 
         # ── Step 4: 执行任务 (按依赖顺序) ──
@@ -301,7 +300,9 @@ class Orchestrator:
         """
         client = get_llm_client()
 
-        valid_intents = "\n".join(f"  - {k}: {v['description']}" for k, v in INTENT_ROUTING.items())
+        valid_intents = "\n".join(
+            f"  - {k}: {v['description']}" for k, v in INTENT_ROUTING.items()
+        )
 
         prompt = f"""将用户问题分类到以下保险业务场景之一:
 
@@ -331,14 +332,18 @@ class Orchestrator:
 
             # 低置信度 → 降级 FAQ
             if confidence < 0.6:
-                logger.info(f"[Orchestrator] LLM 分类低置信度 ({confidence}) → RAG 降级")
+                logger.info(
+                    f"[Orchestrator] LLM 分类低置信度 ({confidence}) → RAG 降级"
+                )
                 return {"primary": "service", "secondary": None, "mode": "rag_fallback"}
 
             # 查路由表
             if intent in INTENT_ROUTING:
                 return INTENT_ROUTING[intent].copy()
 
-            logger.warning(f"[Orchestrator] LLM 分类 '{intent}' 不在路由表中 → RAG 降级")
+            logger.warning(
+                f"[Orchestrator] LLM 分类 '{intent}' 不在路由表中 → RAG 降级"
+            )
 
         except Exception as e:
             logger.error(f"[Orchestrator] LLM 分类失败: {e}")
@@ -351,8 +356,12 @@ class Orchestrator:
     # ================================================================
 
     def _build_tasks(
-        self, query: str, intent: str, entities: dict,
-        route: dict, user_profile: dict,
+        self,
+        query: str,
+        intent: str,
+        entities: dict,
+        route: dict,
+        user_profile: dict,
     ) -> list[SubAgentTask]:
         """
         将用户请求拆解为子 Agent 任务列表
@@ -371,13 +380,12 @@ class Orchestrator:
             user_query=query,
             entities=entities,
             context={"user_profile": user_profile},
-            dependencies=[],        # 无依赖，第一个执行
+            dependencies=[],  # 无依赖，第一个执行
             priority=10,
         )
         tasks.append(primary)
         logger.info(
-            f"[Orchestrator] 主任务 task_0: {primary.agent_name} "
-            f"(intent={intent})"
+            f"[Orchestrator] 主任务 task_0: {primary.agent_name} (intent={intent})"
         )
 
         # ── 辅助 Agent 任务 (仅 multi_agent 模式) ──
@@ -392,18 +400,19 @@ class Orchestrator:
                     "user_profile": user_profile,
                     "awaiting_result_from": "task_0",
                 },
-                dependencies=["task_0"],   # 依赖主 Agent 完成
+                dependencies=["task_0"],  # 依赖主 Agent 完成
                 priority=5,
             )
             tasks.append(secondary)
             logger.info(
-                f"[Orchestrator] 辅助任务 task_1: {secondary.agent_name} "
-                f"(依赖 task_0)"
+                f"[Orchestrator] 辅助任务 task_1: {secondary.agent_name} (依赖 task_0)"
             )
 
         return tasks
 
-    def _derive_secondary_intent(self, primary_intent: str, secondary_agent: str) -> str:
+    def _derive_secondary_intent(
+        self, primary_intent: str, secondary_agent: str
+    ) -> str:
         """
         根据主意图推导辅助 Agent 的子意图
 
@@ -485,19 +494,23 @@ class Orchestrator:
                 f"(query={task.user_query[:50]})"
             )
 
-            result = agent.invoke({
-                "task_id": task.task_id,
-                "intent": task.intent,
-                "user_query": task.user_query,
-                "context": task.context,
-                "entities": task.entities,
-                "session_id": session_id,
-            })
+            result = agent.invoke(
+                {
+                    "task_id": task.task_id,
+                    "intent": task.intent,
+                    "user_query": task.user_query,
+                    "context": task.context,
+                    "entities": task.entities,
+                    "session_id": session_id,
+                }
+            )
 
             results[task.task_id] = result
             completed.add(task.task_id)
 
-            status_icon = {"success": "✓", "degraded": "△", "failed": "✗"}.get(result.status, "?")
+            status_icon = {"success": "✓", "degraded": "△", "failed": "✗"}.get(
+                result.status, "?"
+            )
             logger.info(
                 f"[Orchestrator] {status_icon} {task.task_id} ({task.agent_name}): "
                 f"status={result.status} latency={result.latency_ms:.0f}ms "
@@ -516,8 +529,11 @@ class Orchestrator:
     # ================================================================
 
     def _aggregate_results(
-        self, query: str, intent: str,
-        results: dict, tasks: list[SubAgentTask],
+        self,
+        query: str,
+        intent: str,
+        results: dict,
+        tasks: list[SubAgentTask],
     ) -> str:
         """
         聚合所有子 Agent 的结果为最终答案
@@ -528,13 +544,9 @@ class Orchestrator:
         """
         # ── 收集成功结果 ──
         success = {
-            tid: r for tid, r in results.items()
-            if r.status in ("success", "degraded")
+            tid: r for tid, r in results.items() if r.status in ("success", "degraded")
         }
-        failed = {
-            tid: r for tid, r in results.items()
-            if r.status == "failed"
-        }
+        failed = {tid: r for tid, r in results.items() if r.status == "failed"}
 
         # ── 全部失败 ──
         if not success:
@@ -557,8 +569,11 @@ class Orchestrator:
         return self._llm_aggregate(query, intent, success, tasks)
 
     def _llm_aggregate(
-        self, query: str, intent: str,
-        results: dict, tasks: list[SubAgentTask],
+        self,
+        query: str,
+        intent: str,
+        results: dict,
+        tasks: list[SubAgentTask],
     ) -> str:
         """LLM 整合多个 Agent 的结果"""
         # 拼接各 Agent 结果
@@ -640,8 +655,9 @@ class Orchestrator:
     # RAG 降级
     # ================================================================
 
-    def _rag_fallback(self, query: str, intent: str, entities: dict,
-                      precomputed_answer: str = None) -> dict:
+    def _rag_fallback(
+        self, query: str, intent: str, entities: dict, precomputed_answer: str = None
+    ) -> dict:
         """
         降级为 RAG 模式
 
