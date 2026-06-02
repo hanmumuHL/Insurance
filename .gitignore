@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 配置 (不要提交密钥)
+config/.env
+opencode.json
+
+# 日志
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 模型文件 (太大)
+models/
+*.pt
+*.pth
+*.bin
+*.gguf
