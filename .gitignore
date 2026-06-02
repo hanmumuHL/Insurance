@@ -15,6 +15,11 @@ env/
 config/.env
 opencode.json
 
+# 内部设计文档
+AGENT_MERMAID.md
+INSURANCE_RAG_ARCHITECTURE.md
+RAG_MERMAID.md
+
 # 日志
 logs/*.log
 
