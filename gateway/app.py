@@ -19,20 +19,21 @@ SSE (Server-Sent Events) 流式返回:
 
 import json
 import asyncio
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel, Field
-# from typing import Optional
+from typing import Optional
 
 from base.logger import logger
 from rag_qa.core.rag_system import RAGSystem
 
-# ── 多 Agent 架构 (Phase 3 — 统一入口) ──
+# ── 多 Agent 架构 ──
 from agent.sub_agents import (
     InsuranceAgent, UnderwritingAgent, ClaimAgent, ServiceAgent,
 )
 from agent.orchestrator import Orchestrator
+from agent.memory import get_memory_manager
 
 
 # ============================================================
@@ -41,8 +42,8 @@ from agent.orchestrator import Orchestrator
 
 app = FastAPI(
     title="保险智能客服 API",
-    description="RAG 智能客服 + 多 Agent 协作 (Orchestrator + 4 领域 Agent)",
-    version="2.0.0",
+    description="RAG 智能客服 + 纯多 Agent 协作 (Orchestrator + 4 领域 Agent)",
+    version="3.0.0",
 )
 
 # 跨域配置 (开发环境允许所有来源，生产环境应该限制)
@@ -63,10 +64,9 @@ _orchestrator = None  # type: Optional[Orchestrator]
 
 def init_multi_agent():
     """
-    初始化多 Agent 系统
+    初始化多 Agent 系统（含短记忆 checkpointer）
 
-    在 startup 事件或首次 /chat/multi_agent 请求时调用。
-    如果初始化失败（如基础服务未连接），优雅降级——返回 None。
+    在 startup 或首次请求时懒加载，失败则优雅降级。
     """
     global _orchestrator
 
@@ -74,13 +74,10 @@ def init_multi_agent():
         return _orchestrator
 
     try:
-        # 获取共享的基础服务实例
         from base.llm_client import get_llm_client
 
         llm_client = get_llm_client()
 
-        # 尝试获取 VectorStore / MySQL / Redis
-        # 这些在 RAGSystem 初始化时已建立连接
         vector_store = None
         mysql_session = None
         redis_session = None
@@ -92,52 +89,58 @@ def init_multi_agent():
 
         try:
             from cache.redis_client import get_redis_client
-
             redis_session = get_redis_client()
         except Exception:
             pass
 
         try:
             from base.database import get_mysql_session
-
             mysql_session = get_mysql_session()
         except Exception:
             pass
 
-        # ── 创建四个子 Agent ──
+        # ── 短记忆: RedisSaver checkpointer ──
+        mm = get_memory_manager()
+        checkpointer = mm.get_checkpointer()
+
+        # ── 创建四个子 Agent（注入 checkpointer）──
         agents = {
             "insurance": InsuranceAgent(
                 vector_store=vector_store,
                 mysql_session=mysql_session,
                 redis_session=redis_session,
                 llm_client=llm_client,
+                checkpointer=checkpointer,
             ),
             "underwriting": UnderwritingAgent(
                 vector_store=vector_store,
                 mysql_session=mysql_session,
                 redis_session=redis_session,
                 llm_client=llm_client,
+                checkpointer=checkpointer,
             ),
             "claim": ClaimAgent(
                 vector_store=vector_store,
                 mysql_session=mysql_session,
                 redis_session=redis_session,
                 llm_client=llm_client,
+                checkpointer=checkpointer,
             ),
             "service": ServiceAgent(
                 vector_store=vector_store,
                 mysql_session=mysql_session,
                 redis_session=redis_session,
                 llm_client=llm_client,
+                checkpointer=checkpointer,
             ),
         }
 
-        # ── 创建 Orchestrator ──
         _orchestrator = Orchestrator(agents=agents, rag_system=rag_system)
 
         logger.info(
             f"多 Agent 系统初始化完成 — "
             f"已注册: {list(agents.keys())} | "
+            f"checkpointer: {'RedisSaver' if checkpointer else '无状态'} | "
             f"RAG 降级: {'可用' if rag_system else '不可用'}"
         )
 
@@ -189,26 +192,27 @@ class IngestRequest(BaseModel):
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+async def chat(
+    request: ChatRequest,
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
     """
-    统一问答端点 — Orchestrator 多 Agent 协作
+    统一问答端点 — Orchestrator 多 Agent 协作（含长短记忆）
 
-    所有请求统一走 Orchestrator，内部自动路由:
-      - 简单 FAQ / 闲聊      → RAG 降级 (<3ms)
-      - 产品咨询 / 保费试算   → InsuranceAgent
-      - 核保咨询              → UnderwritingAgent
-      - 理赔咨询 / 条款解读   → ClaimAgent (+ UnderwritingAgent 辅助)
-      - 保单查询 / 转人工     → ServiceAgent
-      - 投诉 / 短 query       → RAG 降级
+    Header:
+      X-User-Id: 用户 ID（Spring 网关认证后注入），用于查询长记忆
 
-    不再区分 RAG 模式和 Agent 模式——Orchestrator 自动判断。
+    所有请求统一走 Orchestrator，内部自动路由。
     """
-    logger.info(f"收到请求: query='{request.query[:50]}'")
+    user_id = x_user_id or ""
+    logger.info(
+        f"收到请求: user_id={user_id[:8] if user_id else '?'} "
+        f"query='{request.query[:50]}'"
+    )
 
     # ── 初始化多 Agent 系统 (懒加载) ──
     orch = init_multi_agent()
     if orch is None:
-        # 降级为纯 RAG
         logger.warning("多 Agent 不可用，降级为纯 RAG")
         try:
             result = rag_system.query(request.query, session_id=request.session_id)
@@ -227,8 +231,16 @@ async def chat(request: ChatRequest):
             )
 
     try:
-        # ── 第 1 步: 快速获取 intent + entities (复用 RAG pipeline) ──
-        # 用 RAG 的意图分类器（规则层 0ms + BERT 层 5ms），不触发完整 RAG pipeline
+        # ── 第 1 步: 构建 user_profile (长记忆) ──
+        user_profile = {}
+        if user_id:
+            try:
+                mm = get_memory_manager()
+                user_profile = mm.get_user_profile(user_id)
+            except Exception as e:
+                logger.warning(f"获取用户画像失败: {e}，降级为空画像")
+
+        # ── 第 2 步: 意图分类 ──
         intent = ""
         entities = {}
         try:
@@ -240,12 +252,13 @@ async def chat(request: ChatRequest):
         except Exception as e:
             logger.warning(f"意图分类失败: {e}，使用默认路由")
 
-        # ── 第 2 步: Orchestrator 处理 ──
+        # ── 第 3 步: Orchestrator 处理（注入长记忆 + session_id 用于短记忆）──
         result = orch.process(
             query=request.query,
             intent=intent,
             entities=entities,
             session_id=request.session_id,
+            user_profile=user_profile,
         )
 
         return ChatResponse(
@@ -259,23 +272,6 @@ async def chat(request: ChatRequest):
     except Exception as e:
         logger.error(f"处理请求失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="服务器内部错误")
-
-
-# ============================================================
-# 端点 1.5: 多 Agent 协作问答 (Phase 3)
-# ============================================================
-# 端点 2: 多 Agent 别名 (向后兼容 — 等同于 /chat)
-# ============================================================
-
-@app.post("/chat/multi_agent", response_model=ChatResponse)
-async def chat_multi_agent(request: ChatRequest):
-    """
-    多 Agent 协作问答 (向后兼容别名 — 等同于 POST /chat)
-
-    Phase 3 统一后，所有请求均走 Orchestrator，无需单独端点。
-    保留此端点仅为向后兼容。
-    """
-    return await chat(request)
 
 
 # ============================================================

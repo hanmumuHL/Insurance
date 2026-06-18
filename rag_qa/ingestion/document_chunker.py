@@ -67,10 +67,11 @@ class DocumentChunker:
         parent_ratio: 每个父块包含多少个子块，默认 4
     """
 
-    def __init__(self, chunk_size: int = 512, overlap: int = 64, parent_ratio: int = 4):
+    def __init__(self, chunk_size: int = 512, overlap: int = 64, parent_ratio: int = 4, segmenter=None):
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.parent_ratio = parent_ratio
+        self.segmenter = segmenter
 
     def chunk(self, text: str, doc_id: str, metadata: dict = None) -> list[Chunk]:
         """
@@ -84,12 +85,76 @@ class DocumentChunker:
         Returns:
             list[Chunk]: 所有子块 + 所有父块
 
-        流程:
-          1. 按句子边界切分（不在句子中间断开）
-          2. 合并句子为子块（~512字），带 overlap
-          3. 合并子块为父块（每 4 个子块 = 1 个父块）
-          4. 生成 chunk_id，关联父子关系
+        两种父块策略:
+          - BERT 语义分割 (segmenter 可用): 达摩院模型切出语义边界 → 每个段落=1个父块
+          - 固定比例 (segmenter 不可用): 每 parent_ratio 个子块合并为 1 个父块
         """
+        if metadata is None:
+            metadata = {}
+
+        if self.segmenter:
+            return self._chunk_with_segmenter(text, doc_id, metadata)
+        else:
+            return self._chunk_fixed_ratio(text, doc_id, metadata)
+
+    # ── BERT 语义父块 ──────────────────────
+
+    def _chunk_with_segmenter(self, text: str, doc_id: str, metadata: dict) -> list[Chunk]:
+        """BERT 语义分割 → 每个段落=1个父块 → 父块内独立生成了块"""
+        try:
+            parent_texts = self.segmenter.segment(text)
+        except Exception as e:
+            logger.warning(f"BERT 分割失败，降级为固定比例: {e}")
+            return self._chunk_fixed_ratio(text, doc_id, metadata)
+
+        if not parent_texts:
+            return []
+
+        logger.info(f"BERT 语义分割: {len(parent_texts)} 个父块")
+
+        chunks = []
+        child_index = 0
+
+        for parent_idx, parent_text in enumerate(parent_texts):
+            parent_chunk_id = f"{doc_id}_parent_{parent_idx:04d}"
+
+            # ── 在父块内: 句子切分 → 合并子块 ──
+            sentences = self._split_sentences(parent_text)
+            child_texts = self._merge_to_chunks(sentences, self.chunk_size, self.overlap)
+
+            # ── 构造子块 ──
+            for child_text in child_texts:
+                chunks.append(Chunk(
+                    chunk_id=f"{doc_id}_child_{child_index:04d}",
+                    text=child_text,
+                    chunk_type="child",
+                    parent_id=parent_chunk_id,
+                    parent_text=parent_text,
+                    chunk_index=child_index,
+                    metadata={**metadata},
+                ))
+                child_index += 1
+
+            # ── 构造父块 ──
+            chunks.append(Chunk(
+                chunk_id=parent_chunk_id,
+                text=parent_text,
+                chunk_type="parent",
+                parent_id=None,
+                parent_text=parent_text,
+                chunk_index=-1,
+                metadata={**metadata},
+            ))
+
+        logger.info(
+            f"分块完成: {child_index} 子块 + {len(parent_texts)} 父块 = {len(chunks)} 总计"
+        )
+        return chunks
+
+    # ── 固定比例父块 (原逻辑) ────────────
+
+    def _chunk_fixed_ratio(self, text: str, doc_id: str, metadata: dict) -> list[Chunk]:
+        """固定比例父块切分（原逻辑，segmenter 不可用时降级）"""
         if metadata is None:
             metadata = {}
 
@@ -104,7 +169,6 @@ class DocumentChunker:
         # ── 步骤 3: 合并为父块 (每 parent_ratio 个子块 = 1 个父块) ──
         parent_texts = []
         for i in range(0, len(child_texts), self.parent_ratio):
-            # 合并连续的 parent_ratio 个子块为一个父块
             group = child_texts[i:i + self.parent_ratio]
             parent_texts.append("".join(group))
         logger.info(f"父块生成: {len(parent_texts)} 个父块")
@@ -112,7 +176,6 @@ class DocumentChunker:
         # ── 步骤 4: 构造 Chunk 对象 ──
         chunks = []
 
-        # 子块
         for i, child_text in enumerate(child_texts):
             parent_idx = i // self.parent_ratio
             parent_chunk_id = f"{doc_id}_parent_{parent_idx:04d}"
@@ -127,21 +190,19 @@ class DocumentChunker:
                 metadata={**metadata},
             ))
 
-        # 父块
         for i, parent_text in enumerate(parent_texts):
             chunks.append(Chunk(
                 chunk_id=f"{doc_id}_parent_{i:04d}",
                 text=parent_text,
                 chunk_type="parent",
-                parent_id=None,       # 父块没有父块
+                parent_id=None,
                 parent_text=parent_text,
-                chunk_index=-1,       # -1 表示父块
+                chunk_index=-1,
                 metadata={**metadata},
             ))
 
         logger.info(
-            f"分块完成: {len(child_texts)} 子块 + {len(parent_texts)} 父块 "
-            f"= {len(chunks)} 总计"
+            f"分块完成: {len(child_texts)} 子块 + {len(parent_texts)} 父块 = {len(chunks)} 总计"
         )
 
         return chunks

@@ -389,6 +389,15 @@ class VectorStore:
     # 内部方法
     # ============================================================
 
+    # ============================================================
+    # 辅助方法
+    # ============================================================
+
+    @staticmethod
+    def _escape_filter_value(value: str) -> str:
+        """转义 Milvus 过滤表达式中的特殊字符（双引号、反斜杠）"""
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
     def _build_filter_expr(self, filters: dict) -> str:
         """
         将 dict 过滤条件转换为 Milvus 表达式字符串
@@ -415,13 +424,17 @@ class VectorStore:
             for key, value in filters.items():
                 if key == "product_name":
                     # 产品名用前缀匹配（用户可能只输入部分产品名）
-                    conditions.append(f'{key} like "{value}%"')
+                    escaped_val = self._escape_filter_value(value)
+                    conditions.append(f'{key} like "{escaped_val}%"')
                 elif key == "clause_type" and isinstance(value, list):
                     # 条款类型支持列表: ["保险责任", "释义"]
-                    quoted = ", ".join(f'"{v}"' for v in value)
+                    quoted = ", ".join(
+                        f'"{self._escape_filter_value(v)}"' for v in value
+                    )
                     conditions.append(f"{key} in [{quoted}]")
                 else:
-                    conditions.append(f'{key} == "{value}"')
+                    escaped_val = self._escape_filter_value(str(value))
+                    conditions.append(f'{key} == "{escaped_val}"')
 
         return " and ".join(conditions)
 
@@ -583,8 +596,21 @@ class VectorStore:
         old_chunks = self.collection.query(expr, output_fields=["id"])
 
         if old_chunks:
-            # 逐条更新 is_valid 字段（Milvus 2.4+ 支持 upsert）
             old_ids = [c["id"] for c in old_chunks]
-            logger.info(
-                f"标记 {len(old_ids)} 条旧版本 chunks 失效: {insurer}/{product_code}"
+            # Milvus 不支持单字段 UPDATE，采用「删旧+重插」策略：
+            # 先查询旧 chunk 的完整实体，改 is_valid=False 后重新插入
+            old_entities = self.collection.query(
+                expr, output_fields=["*"],
             )
+            if old_entities:
+                # 标记失效
+                for e in old_entities:
+                    e["is_valid"] = False
+                # 删除旧实体，然后重新插入失效版本
+                self.collection.delete(expr)
+                self.collection.flush()
+                self.collection.insert(old_entities)
+                self.collection.flush()
+                logger.info(
+                    f"标记 {len(old_ids)} 条旧版本 chunks 失效: {insurer}/{product_code}"
+                )

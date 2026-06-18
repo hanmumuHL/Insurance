@@ -76,9 +76,11 @@ class RedisConfig:
 
 @dataclass
 class ModelPaths:
-    bge_m3: str = field(default_factory=lambda: _env("BGE_M3_MODEL_PATH", "BAAI/bge-m3"))
-    reranker: str = field(default_factory=lambda: _env("RERANKER_MODEL_PATH", "BAAI/bge-reranker-large"))
-    bert_classifier: str = field(default_factory=lambda: _env("BERT_CLASSIFIER_PATH", "bert-base-chinese"))
+    bge_m3: str = field(default_factory=lambda: _env("BGE_M3_MODEL_PATH", "models/bge-m3"))
+    reranker: str = field(default_factory=lambda: _env("RERANKER_MODEL_PATH", "models/bge-reranker-large"))
+    bert_classifier: str = field(default_factory=lambda: _env("BERT_CLASSIFIER_PATH", "models/bert-base-chinese"))
+    bert_model_dir: str = field(default_factory=lambda: _env("BERT_MODEL_DIR", "models/bert_intent"))
+    bert_segmenter: str = field(default_factory=lambda: _env("BERT_SEGMENTER_PATH", "models/nlp_bert_document-segmentation_chinese-base"))
 
 
 @dataclass

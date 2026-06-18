@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-多 Agent 架构集成测试
+多 Agent 架构集成测试（纯多 Agent 模式）
 
 测试范围:
   1. 子 Agent 基类 (状态图编译、invoke 接口)
-  2. Orchestrator 路由 (各种意图 → 正确的 Agent)
+  2. Orchestrator 路由 (各种意图 → 正确的多 Agent 组合)
   3. 任务拆解与执行 (依赖顺序)
   4. 合规终审 (禁止表述替换)
 
@@ -117,10 +117,10 @@ class TestRouting:
         "intent,expected_primary,expected_mode",
         [
             ("理赔咨询", "claim", "multi_agent"),  # 理赔需要核保辅助
-            ("产品咨询", "insurance", "single_agent"),  # 产品推荐只调投保Agent
-            ("投保流程", "insurance", "multi_agent"),  # 投保+核保
-            ("核保咨询", "underwriting", "single_agent"),  # 核保独立
-            ("保单查询", "service", "single_agent"),  # 客服独立
+            ("产品咨询", "insurance", "multi_agent"),  # 投保 + 客服跟进
+            ("投保流程", "insurance", "multi_agent"),  # 投保 + 核保
+            ("核保咨询", "underwriting", "multi_agent"),  # 核保 + 产品信息
+            ("保单查询", "service", "multi_agent"),  # 客服 + 产品信息
             ("投诉建议", "service", "rag_fallback"),  # 投诉直接降级
             ("闲聊", "service", "rag_fallback"),  # 闲聊降级FAQ
         ],
@@ -171,12 +171,13 @@ class TestTaskBuilding:
     def setup_method(self):
         self.orch = Orchestrator(agents={})
 
-    def test_single_agent_builds_one_task(self):
+    def test_multi_agent_builds_two_tasks_for_product_consult(self):
         route = INTENT_ROUTING["产品咨询"]
         tasks = self.orch._build_tasks("推荐医疗险", "产品咨询", {}, route, {})
-        assert len(tasks) == 1
+        assert len(tasks) == 2
         assert tasks[0].agent_name == "insurance"
-        assert tasks[0].dependencies == []
+        assert tasks[1].agent_name == "service"
+        assert tasks[1].dependencies == ["task_0"]
 
     def test_multi_agent_builds_two_tasks(self):
         route = INTENT_ROUTING["理赔咨询"]
@@ -291,7 +292,7 @@ class TestResultAggregation:
     def setup_method(self):
         self.orch = Orchestrator(agents={})
 
-    def test_single_agent_result_returned_directly(self):
+    def test_multi_agent_result_aggregated_correctly(self):
         results = {
             "task_0": SubAgentResult(
                 agent_name="claim",
@@ -352,23 +353,33 @@ class TestComplianceReview:
 class TestEndToEnd:
     """端到端: process() 完整流程"""
 
-    def test_single_agent_e2e(self):
+    def test_multi_agent_e2e_product_consult(self):
         orch = Orchestrator(
             agents={
                 "insurance": MockSuccessAgent(
                     "insurance", "推荐尊享e生2024，年保费4560元"
                 ),
+                "service": MockSuccessAgent(
+                    "service", "如需购买请联系客服400-XXX-XXXX"
+                ),
             }
         )
-        result = orch.process(
-            query="30岁想买一份医疗险有什么推荐的",  # >8字，不走降级
-            intent="产品咨询",
-            entities={},
-            session_id="test",
-        )
-        assert result["route_mode"] == "single_agent"
+        # Mock LLM 聚合
+        with patch.object(
+            orch,
+            "_llm_aggregate",
+            return_value="推荐尊享e生2024，年保费4560元。如需购买请联系客服400-XXX-XXXX。",
+        ):
+            result = orch.process(
+                query="30岁想买一份医疗险有什么推荐的",  # >8字，不走降级
+                intent="产品咨询",
+                entities={},
+                session_id="test",
+            )
+        assert result["route_mode"] == "multi_agent"
         assert "尊享e生" in result["answer"]
         assert "insurance" in result["agents_used"]
+        assert "service" in result["agents_used"]
 
     def test_multi_agent_e2e_with_mock_llm(self):
         """多 Agent 端到端 (mock LLM 聚合)"""

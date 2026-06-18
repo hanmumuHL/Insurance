@@ -8,9 +8,9 @@
   3. 子 Agent 之间不直接通信，通过 Orchestrator 协调
   4. 每个子 Agent 有独立的工具集、Prompt 模板、合规约束
 
-子 Agent 与单 Agent 的区别:
-  单 Agent: 一个 Planner 管所有 7 个工具，Prompt 里塞了所有规则
-  子 Agent: 只暴露本领域 3-5 个工具，Prompt 是领域专属的，规则不冲突
+子 Agent 的设计优势:
+  每个子 Agent 只暴露本领域 3-5 个工具，Prompt 是领域专属的，规则不冲突。
+  通过 Orchestrator 统一调度，支持多 Agent 协作处理复杂意图。
 """
 
 from abc import ABC, abstractmethod
@@ -64,16 +64,19 @@ class SubAgent(ABC):
       })
     """
 
-    def __init__(self, name: str, model: str = "deepseek-v3"):
+    def __init__(self, name: str, model: str = "deepseek-v3", checkpointer=None):
         """
         Args:
             name: Agent 名称 (用于日志和路由，如 "claim", "insurance")
             model: 使用的模型
                    "deepseek-v3"  → 轻量任务 (投保推荐/客服FAQ)
                    "deepseek-r1"  → 需要推理的任务 (理赔判断/核保评估)
+            checkpointer: LangGraph checkpointer (RedisSaver)，用于短记忆持久化。
+                          None 时降级为无状态模式。
         """
         self.name = name
         self.model = model
+        self._checkpointer = checkpointer
         self.graph = self._build_graph()
 
     # ================================================================
@@ -127,23 +130,20 @@ class SubAgent(ABC):
 
     def _build_graph(self) -> StateGraph:
         """
-        构建子 Agent 的 LangGraph 状态图
+        构建子 Agent 的 LangGraph 状态图（支持短记忆持久化）
 
         标准架构: plan → exec → check → synthesize
-        与单 Agent 图的区别:
-          1. Planner 的 Prompt 加了 _get_system_prompt()
-          2. Synthesizer 加了 _get_compliance_rules()
-          3. 状态更聚焦——不需要意图路由 (Orchestrator 已处理)
+        带有 RedisSaver checkpointer 时，messages 字段自动跨轮持久化。
+
+        thread_id = session_id，同一 session 的多次 invoke 会恢复历史对话。
         """
         graph = StateGraph(dict)
 
-        # ── 节点 ──
-        graph.add_node("plan", self._plan_node)            # 规划: 选工具 + 定顺序
-        graph.add_node("exec", self._exec_node)            # 执行: 按计划调工具
-        graph.add_node("check", self._check_node)          # 检查: 结果是否充分
-        graph.add_node("synthesize", self._synthesize_node) # 合成: 整合结果生成答案
+        graph.add_node("plan", self._plan_node)
+        graph.add_node("exec", self._exec_node)
+        graph.add_node("check", self._check_node)
+        graph.add_node("synthesize", self._synthesize_node)
 
-        # ── 边 ──
         graph.add_edge(START, "plan")
         graph.add_edge("plan", "exec")
         graph.add_edge("exec", "check")
@@ -154,7 +154,11 @@ class SubAgent(ABC):
         )
         graph.add_edge("synthesize", END)
 
-        return graph.compile()
+        kwargs = {}
+        if self._checkpointer is not None:
+            kwargs["checkpointer"] = self._checkpointer
+
+        return graph.compile(**kwargs)
 
     # ================================================================
     # 主入口: invoke(task) → SubAgentResult
@@ -162,7 +166,7 @@ class SubAgent(ABC):
 
     def invoke(self, task: dict) -> SubAgentResult:
         """
-        执行子 Agent 任务
+        执行子 Agent 任务（支持跨轮对话记忆）
 
         Args:
             task: {
@@ -171,7 +175,7 @@ class SubAgent(ABC):
                 "user_query": str,     # 用户原始问题
                 "context": dict,       # 上游 Agent 的上下文 (Orchestrator 注入)
                 "entities": dict,      # 提取的实体
-                "session_id": str,     # 会话 ID
+                "session_id": str,     # 会话 ID → 用作 thread_id 恢复历史
             }
 
         Returns:
@@ -180,15 +184,20 @@ class SubAgent(ABC):
         import time
         t0 = time.time()
 
+        session_id = task.get("session_id", "")
+
         # ── 构造初始状态 ──
+        # 注意: messages 字段使用 LangGraph add_messages annotator，
+        # 如果 checkpointer 生效，同 thread_id 的旧 messages 会自动恢复。
+        # 这里只传当前轮的用户消息，历史消息由 checkpointer 自动合并。
         initial_state = {
             "user_query": task.get("user_query", ""),
             "intent": task.get("intent", ""),
             "entities": task.get("entities", {}),
             "context": task.get("context", {}),
-            "session_id": task.get("session_id", ""),
+            "session_id": session_id,
             "iteration": 0,
-            "max_iterations": 3,       # 子 Agent 最多迭代 3 次 (比单 Agent 少)
+            "max_iterations": 3,
             "messages": [],
             "plan": None,
             "current_tool_index": 0,
@@ -196,9 +205,18 @@ class SubAgent(ABC):
             "final_answer": "",
         }
 
+        # ── 构建 invoke config（绑定 thread_id 用于 checkpoint 恢复）──
+        invoke_config = None
+        if self._checkpointer is not None and session_id:
+            invoke_config = {"configurable": {"thread_id": session_id}}
+
         # ── 执行状态图 ──
         try:
-            result = self.graph.invoke(initial_state)
+            kwargs = {"input": initial_state}
+            if invoke_config:
+                kwargs["config"] = invoke_config
+
+            result = self.graph.invoke(**kwargs)
             latency = (time.time() - t0) * 1000
 
             return SubAgentResult(
@@ -239,10 +257,9 @@ class SubAgent(ABC):
         """
         Planner 节点 — 分析 query + context，生成工具调用计划
 
-        与单 Agent Planner 的区别:
-          1. Prompt 前缀加 _get_system_prompt()
-          2. Context 中包含 Orchestrator 传递的上游结果
-          3. 工具列表是领域专属的 (3-5 个而非 7 个)
+        输入:
+          user_query, intent, entities, context (含 user_profile + 上游结果)
+          messages (由 checkpointer 自动恢复的对话历史)
         """
         from base.llm_client import get_llm_client
         from base.logger import logger
@@ -251,6 +268,42 @@ class SubAgent(ABC):
         intent = state.get("intent", "")
         entities = state.get("entities", {})
         context = state.get("context", {})
+
+        # ── 对话历史 (由 checkpointer 自动恢复) ──
+        messages = state.get("messages", [])
+        conversation_summary = ""
+        if messages:
+            recent = messages[-6:]  # 最近 3 轮 (user+assistant 各一条)
+            conversation_summary = "最近对话:\n" + "\n".join(
+                f"  {'👤' if m.type == 'human' else '🤖'}: {str(m.content)[:200]}"
+                for m in recent
+            )
+
+        # ── 用户画像 (长记忆) ──
+        user_profile = context.get("user_profile", {})
+        profile_summary = ""
+        if user_profile.get("has_data"):
+            policies = user_profile.get("policies", [])
+            claims = user_profile.get("claims", [])
+            parts = []
+            if policies:
+                parts.append(
+                    f"已购保单({len(policies)}): "
+                    + "; ".join(
+                        f"{p['product_name']}({p['insurer']}, {p['status']})"
+                        for p in policies[:3]
+                    )
+                )
+            if claims:
+                parts.append(
+                    f"理赔记录({len(claims)}): "
+                    + "; ".join(
+                        f"{c['report_no']}({c['status']})"
+                        for c in claims[:3]
+                    )
+                )
+            if parts:
+                profile_summary = "用户画像:\n" + "\n".join(f"  • {p}" for p in parts)
 
         # ── 领域专属工具 ──
         tools = self._get_tools()
@@ -263,13 +316,19 @@ class SubAgent(ABC):
             f"  - {t.name}: {t.description}" for t in tools
         )
 
-        # ── 领域专属 Prompt ──
+        # ── 领域专属 Prompt (含记忆) ──
+        memory_context = ""
+        if conversation_summary:
+            memory_context += f"\n{conversation_summary}\n"
+        if profile_summary:
+            memory_context += f"\n{profile_summary}\n"
+
         planner_prompt = f"""{self._get_system_prompt()}
 
 用户问题: {query}
 用户意图: {intent}
 提取实体: {entities}
-
+{memory_context}
 附加上下文:
 {context}
 
@@ -290,6 +349,7 @@ class SubAgent(ABC):
 - depends_on 是前置依赖的工具索引 (从0开始)，空列表=无依赖
 - 只选必要的工具，不要过度调用
 - 如果问题简单不需要工具，tool_calls 可以为空列表
+- 参考用户画像和历史对话，优先使用上下文中的信息
 """
 
         client = get_llm_client()
@@ -337,27 +397,98 @@ class SubAgent(ABC):
         """
         Executor 节点 — 按计划执行工具调用
 
-        直接复用 agent/graph.py 的 exec_node，因为执行逻辑完全相同。
+        遍历 plan.tool_calls，按依赖顺序执行，记录每个工具的执行状态。
+        使用 self._get_tools() 获取领域专属工具集。
         """
-        from agent.graph import exec_node as _exec
-        return _exec(state)
+        from base.logger import logger
+
+        plan = state.get("plan")
+        if not plan or not plan.tool_calls:
+            logger.info(f"[{self.name}] 无工具调用计划")
+            return {"tool_results": []}
+
+        tool_calls = plan.tool_calls
+        results = list(state.get("tool_results", []))
+        tools = {t.name: t for t in self._get_tools()}
+
+        logger.info(f"[{self.name}] 开始执行: {len(tool_calls)} 个工具调用")
+
+        for i, tc in enumerate(tool_calls):
+            if tc.status in ("done", "running"):
+                continue
+
+            deps_ok = all(
+                tool_calls[dep_idx].status == "done"
+                for dep_idx in tc.depends_on
+                if dep_idx < len(tool_calls)
+            )
+            if not deps_ok:
+                logger.info(f"[{self.name}] 工具 {tc.tool_name} 等待依赖完成")
+                continue
+
+            tc.status = "running"
+            tool = tools.get(tc.tool_name)
+
+            if tool is None:
+                logger.error(f"[{self.name}] 工具不存在: {tc.tool_name}")
+                tc.status = "failed"
+                tc.result = f"工具 {tc.tool_name} 不存在"
+                results.append({"tool": tc.tool_name, "status": "failed", "result": tc.result})
+                continue
+
+            try:
+                result = tool._run(**tc.tool_args)
+                tc.status = "done"
+                tc.result = result
+                results.append({"tool": tc.tool_name, "status": "done", "result": result})
+                logger.info(f"[{self.name}] 工具 {tc.tool_name} 执行成功")
+            except Exception as e:
+                tc.status = "failed"
+                tc.result = f"工具执行失败: {e}"
+                results.append({"tool": tc.tool_name, "status": "failed", "result": tc.result})
+                logger.error(f"[{self.name}] 工具 {tc.tool_name} 执行失败: {e}")
+
+        return {"plan": plan, "tool_results": results}
 
     def _check_node(self, state: dict) -> dict:
         """
-        Checker 节点 — 检查结果完整性
+        Checker 节点 — 检查工具执行结果是否充分
 
-        直接复用 agent/graph.py 的 reflect_node。
+        检查维度:
+          1. 所有工具是否都执行成功
+          2. 结果是否包含足够的信息
+          3. 是否需要补充调用其他工具
         """
-        from agent.graph import reflect_node as _reflect
-        return _reflect(state)
+        from base.logger import logger
+
+        plan = state.get("plan")
+        iteration = state.get("iteration", 0)
+        max_iter = state.get("max_iterations", 3)
+
+        all_done = all(
+            tc.status in ("done", "failed")
+            for tc in (plan.tool_calls if plan else [])
+        )
+
+        if not all_done and iteration < max_iter:
+            logger.info(f"[{self.name}] 部分工具未完成，返回 Planner (iteration={iteration + 1})")
+            return {"iteration": iteration + 1}
+
+        failed = [tc for tc in (plan.tool_calls if plan else []) if tc.status == "failed"]
+        if failed and iteration < max_iter:
+            logger.warning(f"[{self.name}] {len(failed)} 个工具失败，尝试重试")
+            for tc in failed:
+                tc.status = "pending"
+            return {"iteration": iteration + 1}
+
+        logger.info(f"[{self.name}] 所有工具执行完毕，进入 Synthesize")
+        return {"iteration": iteration}
 
     def _synthesize_node(self, state: dict) -> dict:
         """
-        Synthesizer 节点 — 整合工具结果，生成最终答案
+        Synthesizer 节点 — 整合工具结果 + 对话历史，生成最终答案
 
-        与单 Agent Synthesizer 的区别:
-          1. System Prompt 使用领域专属的 (_get_system_prompt)
-          2. 附加合规约束 (_get_compliance_rules)
+        输入含 messages(历史对话) 和 context(用户画像)，确保多轮连贯。
         """
         from base.llm_client import get_llm_client
         from base.logger import logger
@@ -375,7 +506,17 @@ class SubAgent(ABC):
         context_parts = []
         for r in success_results:
             context_parts.append(f"### [{r['tool']}]\n{r['result']}")
-        context = "\n\n".join(context_parts)
+        tool_context = "\n\n".join(context_parts)
+
+        # ── 对话历史 (多轮连贯性) ──
+        messages = state.get("messages", [])
+        history_context = ""
+        if messages:
+            recent = messages[-4:]
+            history_context = "历史对话:\n" + "\n".join(
+                f"  {'用户' if m.type == 'human' else '助手'}: {str(m.content)[:150]}"
+                for m in recent
+            )
 
         # ── 合规约束 ──
         rules = self._get_compliance_rules()
@@ -383,12 +524,11 @@ class SubAgent(ABC):
         disclaimers = "\n".join(f"  - ⚠️ {d}" for d in rules.get("required_disclaimers", []))
 
         # ── 领域专属合成 Prompt ──
-        synthesize_prompt = f"""{self._get_system_prompt()}
-
-用户问题: {query}
+        synthesize_prompt = f"""用户问题: {query}
+{history_context}
 
 工具返回结果:
-{context}
+{tool_context}
 
 合规要求:
 禁止表述:
@@ -403,6 +543,7 @@ class SubAgent(ABC):
 2. 如有金额或条款信息，引用具体来源
 3. 遵守合规要求
 4. 如果不确定，明确告知用户并建议核实
+5. 如果用户问题与历史对话相关，保持回应的连贯性
 """
 
         client = get_llm_client()
@@ -417,7 +558,7 @@ class SubAgent(ABC):
 
         if response.error:
             logger.error(f"[{self.name}] Synthesizer LLM 失败: {response.error}")
-            answer = f"工具结果汇总:\n\n{context}\n\n（答案生成失败，以上为原始工具结果）"
+            answer = f"工具结果汇总:\n\n{tool_context}\n\n（答案生成失败，以上为原始工具结果）"
         else:
             answer = response.content
             logger.info(

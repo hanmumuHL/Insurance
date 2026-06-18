@@ -54,6 +54,7 @@ class BGEM3Encoder:
         self.use_fp16 = use_fp16
         self._model = None
         self._loaded = False
+        self._is_flag = False  # 是否为 FlagEmbedding 模式（支持 Sparse）
 
     def load(self):
         """
@@ -87,6 +88,7 @@ class BGEM3Encoder:
             )
 
             self._loaded = True
+            self._is_flag = True  # 标记为 FlagEmbedding 模式（支持 Sparse）
             logger.info(f"BGE-M3 加载完成 (device={device})")
 
         except ImportError:
@@ -106,7 +108,7 @@ class BGEM3Encoder:
             from sentence_transformers import SentenceTransformer
             self._model = SentenceTransformer(self.model_path)
             self._loaded = True
-            self._fallback_mode = True
+            self._is_flag = False  # 标记为降级模式
             logger.info("BGE-M3 sentence-transformers 加载完成 (无 Sparse 支持)")
         except ImportError:
             raise ImportError(
@@ -246,16 +248,14 @@ class BGEM3Encoder:
 
     def _is_flagembedding(self) -> bool:
         """判断是否使用 FlagEmbedding (支持 Sparse 向量)"""
-        from FlagEmbedding import BGEM3FlagModel
-        return isinstance(self._model, BGEM3FlagModel)
+        return self._is_flag
 
     def __repr__(self):
         device = getattr(self._model, 'device', 'unknown') if self._model else 'none'
-        fallback = getattr(self, '_fallback_mode', False)
         return (
             f"BGEM3Encoder(model={self.model_path}, "
             f"device={device}, "
-            f"sparse={'no' if fallback else 'yes'})"
+            f"sparse={'no' if not self._is_flag else 'yes'})"
         )
 
 

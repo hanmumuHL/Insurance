@@ -216,17 +216,28 @@ class ClaimEligibilityTool(BaseTool):
             coverage_citations = []   # 保险责任引用
             exclusion_citations = []  # 责任免除引用
 
+            # 构建事件关键词列表（只包含用户具体事件，不含宽泛词）
+            event_keywords = [disease_or_event]
+            # 如果事件本身包含中文词组，拆分为子词用于辅助匹配
+            if disease_or_event and len(disease_or_event) > 2:
+                # 例如："意外骨折" -> ["意外骨折", "骨折", "意外"]
+                for i in range(len(disease_or_event) - 1):
+                    sub = disease_or_event[i:i+2]
+                    if sub not in event_keywords:
+                        event_keywords.append(sub)
+
             for chunk in chunks:
                 text = chunk.parent_text or chunk.text
                 citation = f"条款[{chunk.product_name} - {chunk.clause_type}]"
 
-                # 简单规则: 根据条款类型判断
                 if chunk.clause_type == "保险责任":
-                    in_coverage = True
-                    coverage_citations.append(f"{citation}: {text[:100]}...")
+                    # 验证条款内容是否与用户事件语义相关（非仅凭类型判定）
+                    if any(kw in text for kw in event_keywords):
+                        in_coverage = True
+                        coverage_citations.append(f"{citation}: {text[:100]}...")
                 elif chunk.clause_type == "责任免除":
-                    # 检查是否明确排除了该事件
-                    if any(kw in text for kw in [disease_or_event, "住院", "疾病"]):
+                    # 只匹配用户具体事件，移除宽泛的硬编码关键词
+                    if any(kw in text for kw in event_keywords):
                         in_exclusion = True
                         exclusion_citations.append(f"{citation}: {text[:100]}...")
 

@@ -41,7 +41,11 @@ class EmbeddingCache:
         if cached is not None:
             return cached
 
-        vector = encoder.encode(text, normalize_embeddings=True)
+        # 兼容不同 encoder 的参数名：BGEM3Encoder 用 normalize，sentence-transformers 用 normalize_embeddings
+        try:
+            vector = encoder.encode(text, normalize=True)
+        except TypeError:
+            vector = encoder.encode(text, normalize_embeddings=True)
         if isinstance(vector, list):
             vector = np.array(vector)
 

@@ -130,10 +130,9 @@ class AgentState:
 
 
 # ============================================================
-# 多 Agent 架构状态 (Phase 3 — Orchestrator + 子 Agent)
+# 多 Agent 架构状态 — Orchestrator + 子 Agent
 # ============================================================
 # 以下类型用于多 Agent 协作模式。
-# 单 Agent 模式仍使用上面的 AgentState。
 
 
 @dataclass
@@ -185,9 +184,8 @@ class OrchestratorState:
 
         primary_intent: 主意图 (投保/核保/理赔/客服)
         complexity: 复杂度 "simple" | "moderate" | "complex"
-        route_mode: 路由模式
-            "single_agent"  → 只调一个子 Agent
-            "multi_agent"   → 调多个子 Agent 协作
+         route_mode: 路由模式
+            "multi_agent"   → 多子 Agent 协作
             "rag_fallback"   → 降级为纯 RAG
 
         tasks: 拆解后的任务列表
@@ -207,7 +205,7 @@ class OrchestratorState:
     # ── 意图与路由 ──
     primary_intent: str = ""
     complexity: str = "moderate"
-    route_mode: str = "single_agent"
+    route_mode: str = "multi_agent"
 
     # ── 任务规划 ──
     tasks: list[SubAgentTask] = field(default_factory=list)

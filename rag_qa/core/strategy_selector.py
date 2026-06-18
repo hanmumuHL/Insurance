@@ -190,9 +190,27 @@ class StrategySelector:
           → 各自检索 → RRF (Reciprocal Rank Fusion) 融合结果
         """
         filters = self._build_filters(entities)
-        logger.info(f"策略: 子查询拆分 | 检测到多个产品/条件")
+
+        # 从 entities 中提取产品名和维度，生成子查询
+        sub_queries = []
+        products = entities.get("products", [])
+        dimensions = entities.get("dimensions", []) or self._extract_dimensions(query)
+
+        if products and dimensions:
+            for product in products:
+                for dim in dimensions:
+                    sub_queries.append(f"{product} {dim}")
+        elif products:
+            for product in products:
+                sub_queries.append(f"{product} 条款")
+        else:
+            # 无法拆分时回退为原查询
+            sub_queries = [query]
+
+        logger.info(f"策略: 子查询拆分 | 生成 {len(sub_queries)} 个子查询: {sub_queries}")
         return StrategyPlan(
             strategy=StrategyType.SUB_QUERY,
+            sub_queries=sub_queries,
             filters=filters,
             reason="query 含多个产品/条件，拆分子查询并行检索",
         )
@@ -213,9 +231,21 @@ class StrategySelector:
           → LLM 对比 结果A vs 结果B → 生成对比表格
         """
         filters = self._build_filters(entities)
-        logger.info(f"策略: 对比检索 | 产品对比意图")
+
+        # 从 entities 中提取产品名生成对比子查询
+        sub_queries = []
+        products = entities.get("products", [])
+        if products:
+            for product in products:
+                sub_queries.append(f"{product} 保障范围 保费 免赔额")
+        else:
+            # 无法拆分时回退为原查询
+            sub_queries = [query]
+
+        logger.info(f"策略: 对比检索 | 生成 {len(sub_queries)} 路对比子查询")
         return StrategyPlan(
             strategy=StrategyType.COMPARE,
+            sub_queries=sub_queries,
             filters=filters,
             reason="产品对比意图，拆分多路并行检索后交叉对比",
         )
@@ -287,3 +317,26 @@ class StrategySelector:
         模糊 query 适合用 HyDE 增强（先生成假设文档再检索）
         """
         return len(query.strip()) < 8 and not entities
+
+    def _extract_dimensions(self, query: str) -> list:
+        """
+        从 query 中提取查询维度（等待期/免赔额/保费/保障范围等）
+
+        用于子查询拆分策略，抽取用户在问的保险条款维度。
+        """
+        dim_patterns = [
+            r"(等待期|犹豫期|宽限期)",
+            r"(免赔额|起付线|自付比例)",
+            r"(保费|费率|多少钱)",
+            r"(保障范围|保险责任|保什么)",
+            r"(续保|续费|保证续保)",
+            r"(健康告知|核保|告知义务)",
+            r"(理赔|赔付|报销)",
+            r"(犹豫期|退保|现金价值)",
+        ]
+        dimensions = []
+        for pat in dim_patterns:
+            m = re.search(pat, query)
+            if m:
+                dimensions.append(m.group(1))
+        return dimensions

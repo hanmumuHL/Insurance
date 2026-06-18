@@ -89,7 +89,11 @@ class IngestionOrchestrator:
             mysql_session: MySQL 会话（元数据写入）
         """
         self.parser = PDFParser()
-        self.chunker = DocumentChunker(chunk_size=512, overlap=64)
+        from rag_qa.ingestion.bert_segmenter import get_segmenter
+
+        self.chunker = DocumentChunker(
+            chunk_size=512, overlap=64, segmenter=get_segmenter()
+        )
         self.vector_store = vector_store
         self.mysql = mysql_session
 

@@ -33,8 +33,8 @@ class UnderwritingAgent(SubAgent):
     """
 
     def __init__(self, vector_store=None, mysql_session=None, redis_session=None,
-                 llm_client=None, model="deepseek-r1"):
-        super().__init__(name="underwriting", model=model)
+                 llm_client=None, model="deepseek-r1", checkpointer=None):
+        super().__init__(name="underwriting", model=model, checkpointer=checkpointer)
         self._vector_store = vector_store
         self._mysql_session = mysql_session
         self._redis_session = redis_session

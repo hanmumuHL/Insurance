@@ -2,11 +2,10 @@
 """
 RAG 系统主编排器 — 串联所有 RAG 模块，处理一次完整的问答请求
 
-一次完整请求的流转:
-  用户 query
-  → QueryResultCache 检查 (命中则秒回)
+一次完整请求的流转（PII 脱敏/还原由上游 Spring 网关处理）:
+  用户 query（已脱敏）
   → FAQCache 检查 (命中则秒回)
-  → PII 脱敏
+  → QueryResultCache 检查 (命中则秒回)
   → DomainBoundaryGuard 领域守卫 (不相关的直接拒绝)
   → QueryClassifier 三层意图路由
   → 意图被拒绝 → 返回兜底话术
@@ -17,7 +16,6 @@ RAG 系统主编排器 — 串联所有 RAG 模块，处理一次完整的问答
   → RetrievalQualityGuard 检索质量检查 (质量差则拒绝)
   → LLM 生成答案 (DeepSeek 主 + Qwen 降级)
   → ComplianceGuard 合规检查
-  → PII 还原
   → QueryResultCache 写入缓存
   → 返回用户
 
@@ -39,7 +37,6 @@ from base.reranker import get_reranker
 from cache.redis_client import RedisClient
 from cache.faq_cache import FAQCache
 from cache.query_result_cache import QueryResultCache
-from rag_qa.core.pii_desensitizer import PIIDesensitizer
 from rag_qa.core.domain_guard import DomainBoundaryGuard
 from rag_qa.core.query_classifier import QueryClassifier
 from rag_qa.core.strategy_selector import StrategySelector
@@ -110,12 +107,18 @@ class RAGSystem:
         )
 
         # ── 安全层 ──
-        self.pii_desensitizer = PIIDesensitizer()
         self.domain_guard = DomainBoundaryGuard()
 
         # ── 路由层 ──
-        # bert_model 和 llm_client 可选传入，None 时跳过对应层级
-        self.classifier = QueryClassifier(bert_model=None, llm_client=None)
+        # BERT 第二层分类器（延迟加载，失败则降级到规则+LLM）
+        from rag_qa.core.bert_intent_classifier import get_bert_classifier
+
+        bert_model = get_bert_classifier()
+        # 传递 LLM 客户端，启用第三层 LLM 兜底分类
+        llm_client_for_classify = get_llm_client()
+        self.classifier = QueryClassifier(
+            bert_model=bert_model, llm_client=llm_client_for_classify
+        )
         self.strategy_selector = StrategySelector()
 
         # ── 检索层 ──
@@ -162,20 +165,11 @@ class RAGSystem:
                     pipeline=pipeline,
                 )
 
-            # ── 阶段 2: PII 脱敏 (<1ms) ──
-            # 在 query 进入任何处理流程之前先脱敏
-            # 脱敏后的文本用于后续所有流程
-            # mapping 保留，最后用于还原
-            t0 = time.time()
-            pii_result = self.pii_desensitizer.desensitize(raw_query)
-            desensitized_query = pii_result.text
-            pii_mapping = pii_result.mapping
-            pipeline["pii_desensitize"] = round((time.time() - t0) * 1000, 1)
-
-            # ── 阶段 3: 领域边界检查 (<1ms) ──
+            # ── 阶段 2: 领域边界检查 (<1ms) ──
             # 不相关的问题直接拒绝，不走后续任何流程
+            # 注: PII 脱敏由上游 Spring 网关完成，此处接收的已是脱敏后 query
             t0 = time.time()
-            guard_result = self.domain_guard.check(desensitized_query)
+            guard_result = self.domain_guard.check(raw_query)
             pipeline["domain_guard"] = round((time.time() - t0) * 1000, 1)
             if not guard_result.passed:
                 logger.info(f"领域守卫拦截: {guard_result.reason}")
@@ -186,10 +180,10 @@ class RAGSystem:
                     pipeline=pipeline,
                 )
 
-            # ── 阶段 4: 三层意图路由 (~5ms) ──
+            # ── 阶段 3: 三层意图路由 (~5ms) ──
             # 关键词规则 → BERT 分类 → LLM 兜底
             t0 = time.time()
-            intent_result = self.classifier.classify(desensitized_query)
+            intent_result = self.classifier.classify(raw_query)
             pipeline["classify"] = round((time.time() - t0) * 1000, 1)
 
             # 意图被拒绝（OOD 或置信度不足）→ 返回兜底话术
@@ -212,7 +206,7 @@ class RAGSystem:
                 f"| 来源: {intent_result.source} | 实体: {entities}"
             )
 
-            # ── 阶段 5: Query 结果缓存检查 (<1ms) ──
+            # ── 阶段 4: Query 结果缓存检查 (<1ms) ──
             # 已知意图后再查缓存，key 对齐避免 miss
             t0 = time.time()
             cached = self.query_cache.try_get(raw_query, intent)
@@ -226,10 +220,9 @@ class RAGSystem:
                     pipeline=pipeline,
                 )
 
-            # ── 阶段 6: 闲聊意图直接 LLM 回复（不走检索）──
+            # ── 阶段 5: 闲聊意图直接 LLM 回复（不走检索）──
             if intent == "闲聊寒暄":
-                answer = self._llm_chat(desensitized_query)
-                answer = PIIDesensitizer.restore(answer, pii_mapping)
+                answer = self._llm_chat(raw_query)
                 return RAGResponse(
                     answer=answer,
                     intent=intent,
@@ -237,7 +230,7 @@ class RAGSystem:
                     pipeline=pipeline,
                 )
 
-            # ── 阶段 7: 投诉建议 → 转人工（不走检索）──
+            # ── 阶段 6: 投诉建议 → 转人工（不走检索）──
             if intent == "投诉建议":
                 return RAGResponse(
                     answer=(
@@ -249,22 +242,22 @@ class RAGSystem:
                     pipeline=pipeline,
                 )
 
-            # ── 阶段 8: 选择检索策略 ──
+            # ── 阶段 7: 选择检索策略 ──
             t0 = time.time()
             strategy_plan = self.strategy_selector.select(
-                intent, desensitized_query, entities
+                intent, raw_query, entities
             )
             pipeline["strategy_select"] = round((time.time() - t0) * 1000, 1)
             logger.info(
                 f"检索策略: {strategy_plan.strategy.value} | {strategy_plan.reason}"
             )
 
-            # ── 阶段 9: Milvus 混合检索 (~30ms) ──
+            # ── 阶段 8: Milvus 混合检索 (~30ms) ──
             t0 = time.time()
-            chunks = self._do_retrieval(desensitized_query, strategy_plan)
+            chunks = self._do_retrieval(raw_query, strategy_plan)
             pipeline["retrieval"] = round((time.time() - t0) * 1000, 1)
 
-            # ── 阶段 10: 检索质量检查 ──
+            # ── 阶段 9: 检索质量检查 ──
             t0 = time.time()
             quality = self.retrieval_guard.check(chunks, intent)
             pipeline["quality_check"] = round((time.time() - t0) * 1000, 1)
@@ -278,23 +271,29 @@ class RAGSystem:
                     pipeline=pipeline,
                 )
 
-            # ── 阶段 11: LLM 生成答案 (~200ms) ──
+            # ── 阶段 10: LLM 生成答案 (~200ms) ──
             t0 = time.time()
-            answer = self._generate_answer(desensitized_query, chunks, intent)
+            answer = self._generate_answer(raw_query, chunks, intent)
             pipeline["generation"] = round((time.time() - t0) * 1000, 1)
 
-            # ── 阶段 12: 合规检查 ──
+            # ── 阶段 11: 合规检查 ──
             t0 = time.time()
             compliance = self.compliance_guard.check(answer, chunks, intent)
             pipeline["compliance"] = round((time.time() - t0) * 1000, 1)
+            if not compliance.passed:
+                # 合规不通过 → 返回安全兜底话术，不使用修改后的文本
+                logger.warning(f"合规检查不通过: {compliance.violated_rules}")
+                return RAGResponse(
+                    answer="很抱歉，您的问题我暂时无法直接回答。建议您通过官方渠道或联系人工客服获取更准确的信息。",
+                    intent=intent,
+                    strategy=strategy_plan.strategy.value,
+                    latency_ms=round((time.time() - start_time) * 1000, 1),
+                    pipeline=pipeline,
+                )
             if compliance.modified_response:
                 answer = compliance.modified_response
 
-            # ── 阶段 13: PII 还原 ──
-            # LLM 回复中可能包含 [姓名_001] 等占位符，还原为真实值
-            answer = PIIDesensitizer.restore(answer, pii_mapping)
-
-            # ── 阶段 14: 写入缓存 ──
+            # ── 阶段 12: 写入缓存 ──
             self.query_cache.set(
                 raw_query, intent, {"answer": answer, "intent": intent}
             )

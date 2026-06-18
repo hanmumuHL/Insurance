@@ -3,12 +3,11 @@
 Orchestrator — 多 Agent 调度中心
 
 职责:
-  1. 意图路由: 识别用户意图 → 决定走单 Agent / 多 Agent / RAG 降级
-  2. 复杂度判断: 简单查询走客服 Agent，复杂理赔走理赔 Agent + 核保 Agent
-  3. 任务拆解: 将一个用户请求拆成多个子 Agent 任务
-  4. 任务分发: 按依赖顺序串行/并行调用子 Agent
-  5. 结果聚合: 收集所有子 Agent 结果 → 合成最终答案
-  6. 合规终审: 全局合规检查（跨 Agent 一致性校验）
+  1. 意图路由: 识别用户意图 → 决定走多 Agent 协作 / RAG 降级
+  2. 任务拆解: 将一个用户请求拆成多个子 Agent 任务
+  3. 任务分发: 按依赖顺序串行调用子 Agent
+  4. 结果聚合: 收集所有子 Agent 结果 → LLM 合成最终答案
+  5. 合规终审: 全局合规检查（跨 Agent 一致性校验）
 
 通信模式: Orchestrator 中心化调度
   - 子 Agent 之间不直接通信
@@ -42,27 +41,28 @@ from base.logger import logger
 # 意图 → Agent 路由表
 # ================================================================
 # 每种意图对应的主 Agent、辅助 Agent、路由模式。
-# 新增意图类型时只需在此表中添加一行。
+# 所有业务意图均采用多 Agent 协作模式 (multi_agent)。
+# 仅闲聊/投诉等非业务意图降级为 RAG (rag_fallback)。
 
 INTENT_ROUTING = {
-    # ── 投保相关 → 投保 Agent ──
+    # ── 投保相关 → 投保 Agent + 客服 Agent ──
     "产品咨询": {
         "primary": "insurance",
-        "secondary": None,
-        "mode": "single_agent",
-        "description": "产品推荐/保障范围解释/免赔额咨询",
+        "secondary": "service",
+        "mode": "multi_agent",
+        "description": "产品推荐/保障范围解释 + 客服跟进",
     },
     "产品对比": {
         "primary": "insurance",
-        "secondary": None,
-        "mode": "single_agent",
-        "description": "多产品维度对比",
+        "secondary": "service",
+        "mode": "multi_agent",
+        "description": "多产品维度对比 + 客服跟进",
     },
     "保费试算": {
         "primary": "insurance",
-        "secondary": None,
-        "mode": "single_agent",
-        "description": "保费计算",  # 简单试算，不需要核保
+        "secondary": "service",
+        "mode": "multi_agent",
+        "description": "保费计算 + 客服跟进",
     },
     "投保流程": {
         "primary": "insurance",
@@ -70,19 +70,19 @@ INTENT_ROUTING = {
         "mode": "multi_agent",
         "description": "投保引导 + 核保审核",
     },
-    # ── 核保相关 → 核保 Agent ──
+    # ── 核保相关 → 核保 Agent + 投保 Agent ──
     "核保咨询": {
         "primary": "underwriting",
-        "secondary": None,
-        "mode": "single_agent",
-        "description": "健康告知/核保规则/风险评估",
+        "secondary": "insurance",
+        "mode": "multi_agent",
+        "description": "健康告知/核保规则 + 产品信息",
     },
-    # ── 理赔相关 → 理赔 Agent (+ 核保 Agent 辅助) ──
+    # ── 理赔相关 → 理赔 Agent + 核保 Agent ──
     "理赔咨询": {
         "primary": "claim",
         "secondary": "underwriting",
         "mode": "multi_agent",
-        "description": "理赔资格判断 (需要核保确认保障范围/等待期)",
+        "description": "理赔资格判断 + 核保确认保障范围/等待期",
     },
     "理赔进度": {
         "primary": "claim",
@@ -92,16 +92,16 @@ INTENT_ROUTING = {
     },
     "条款解读": {
         "primary": "claim",
-        "secondary": None,
-        "mode": "single_agent",
-        "description": "条款原文检索与解释",
+        "secondary": "insurance",
+        "mode": "multi_agent",
+        "description": "条款检索解释 + 产品上下文",
     },
-    # ── 客服相关 → 客服 Agent ──
+    # ── 客服相关 → 客服 Agent + 投保 Agent ──
     "保单查询": {
         "primary": "service",
-        "secondary": None,
-        "mode": "single_agent",
-        "description": "查询保单状态/保障信息",
+        "secondary": "insurance",
+        "mode": "multi_agent",
+        "description": "查询保单状态 + 产品信息补充",
     },
     # ── 降级场景 → 不走 Agent ──
     "投诉建议": {
@@ -121,14 +121,14 @@ INTENT_ROUTING = {
 
 class Orchestrator:
     """
-    Orchestrator — 多 Agent 调度中心
+    Orchestrator — 多 Agent 调度中心（纯多 Agent 模式）
 
     工作流:
       1. process(query, intent, entities) — 主入口
-      2. _route_intent(intent, query) — 查路由表 + 复杂度判断
+      2. _route_intent(intent, query) — 查路由表
       3. _build_tasks(query, route) — 拆解为 SubAgentTask 列表
       4. _execute_tasks(tasks) — 按依赖顺序调用子 Agent
-      5. _aggregate_results(query, results, tasks) — 合成最终答案
+      5. _aggregate_results(query, results, tasks) — LLM 合成最终答案
       6. _compliance_review(answer) — 全局合规检查
     """
 
@@ -186,7 +186,7 @@ class Orchestrator:
         Returns:
             dict: {
                 "answer": str,                # 最终答案
-                "route_mode": str,            # "single_agent" | "multi_agent" | "rag_fallback"
+                "route_mode": str,            # "multi_agent" | "rag_fallback"
                 "agents_used": [str, ...],    # 使用了哪些 Agent
                 "sources": [dict, ...],       # 条款引用
                 "pipeline": {str: float},     # 各阶段耗时 (ms)
@@ -268,7 +268,7 @@ class Orchestrator:
         路由规则:
           1. 查 INTENT_ROUTING 表 → 命中则直接返回
           2. 意图未知 → LLM 辅助分类
-          3. 简单 query (≤8字且非复杂意图) → 强制降级 RAG
+          3. 极短 query (≤8字且非复杂意图) → 强制降级 RAG
 
         Returns:
             dict: {"primary": str, "secondary": str|None, "mode": str}
@@ -277,8 +277,11 @@ class Orchestrator:
         if intent in INTENT_ROUTING:
             route = INTENT_ROUTING[intent].copy()
 
-            # 简单 query 降级: 短问题且非复杂意图 → 直接 FAQ
-            complex_intents = {"理赔咨询", "产品对比", "核保咨询", "投保流程"}
+            # 简单 query 降级: 短问题且非复杂意图 → 直接 FAQ/RAG
+            # 以下意图需要多步推理，即使 query 很短也不能降级
+            complex_intents = {
+                "理赔咨询", "产品对比", "核保咨询", "投保流程",
+            }
             if len(query) <= 8 and intent not in complex_intents:
                 route["mode"] = "rag_fallback"
                 logger.info(
@@ -367,8 +370,8 @@ class Orchestrator:
         将用户请求拆解为子 Agent 任务列表
 
         策略:
-          single_agent → 1 个任务 (主 Agent)
-          multi_agent  → 2 个任务 (主 Agent + 辅助 Agent，辅助依赖主)
+          multi_agent → 1~2 个任务 (主 Agent + 可选辅助 Agent，辅助依赖主)
+          所有业务意图均创建辅助 Agent 任务，实现多 Agent 协作。
         """
         tasks = []
 
@@ -423,6 +426,12 @@ class Orchestrator:
             ("投保流程", "underwriting"): "核保咨询",
             ("理赔咨询", "underwriting"): "核保咨询",
             ("理赔进度", "service"): "保单查询",
+            ("产品咨询", "service"): "保单查询",
+            ("产品对比", "service"): "保单查询",
+            ("保费试算", "service"): "保单查询",
+            ("核保咨询", "insurance"): "产品咨询",
+            ("条款解读", "insurance"): "产品咨询",
+            ("保单查询", "insurance"): "产品咨询",
         }
         derived = mapping.get((primary_intent, secondary_agent), primary_intent)
         logger.info(
@@ -539,8 +548,8 @@ class Orchestrator:
         聚合所有子 Agent 的结果为最终答案
 
         策略:
-          单 Agent → 直接返回该 Agent 的结果
-          多 Agent → LLM 整合多个 Agent 的结果
+          多 Agent 协作 → LLM 整合所有 Agent 的结果
+          单个结果时直接返回（无需 LLM 聚合）
         """
         # ── 收集成功结果 ──
         success = {
@@ -603,19 +612,25 @@ class Orchestrator:
 5. 答案长度控制在 300 字以内（简洁优先）
 """
 
-        response = client.chat(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=2048,
-        )
+        try:
+            response = client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=2048,
+            )
 
-        if response.error:
-            logger.error(f"[Orchestrator] 聚合 LLM 失败: {response.error}")
+            if response.error:
+                logger.error(f"[Orchestrator] 聚合 LLM 失败: {response.error}")
+                # 降级: 直接拼接
+                parts = [f"【{tid}】{r.result}" for tid, r in results.items()]
+                return "\n\n---\n\n".join(parts)
+
+            return response.content
+        except Exception as e:
+            logger.error(f"[Orchestrator] 聚合 LLM 异常: {e}")
             # 降级: 直接拼接
             parts = [f"【{tid}】{r.result}" for tid, r in results.items()]
             return "\n\n---\n\n".join(parts)
-
-        return response.content
 
     # ================================================================
     # 合规终审

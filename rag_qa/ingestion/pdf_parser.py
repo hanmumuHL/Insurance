@@ -135,18 +135,18 @@ class PDFParser:
             logger.error("请安装 PyMuPDF: pip install PyMuPDF")
             raise
 
-        doc = fitz.open(stream=content, filetype="pdf")
-        full_text = []
+        with fitz.open(stream=content, filetype="pdf") as doc:
+            full_text = []
 
-        for page_num, page in enumerate(doc, 1):
-            # sort=True 按阅读顺序提取，避免多栏布局时文本错乱
-            text = page.get_text("text", sort=True)
-            if text.strip():
-                # 加页码标记，方便后续定位
-                full_text.append(f"\n--- 第{page_num}页 ---\n")
-                full_text.append(text)
+            for page_num, page in enumerate(doc, 1):
+                # sort=True 按阅读顺序提取，避免多栏布局时文本错乱
+                text = page.get_text("text", sort=True)
+                if text.strip():
+                    # 加页码标记，方便后续定位
+                    full_text.append(f"\n--- 第{page_num}页 ---\n")
+                    full_text.append(text)
 
-        return "".join(full_text)
+            return "".join(full_text)
 
     def _parse_with_ocr(self, content: bytes) -> str:
         """
@@ -276,14 +276,14 @@ class PDFParser:
         """
         try:
             import fitz
-            doc = fitz.open(stream=content, filetype="pdf")
-            text_length = 0
-            pages_to_check = min(3, len(doc))
-            for i in range(pages_to_check):
-                text_length += len(doc[i].get_text("text").strip())
-            # 平均每页不到 100 字符 → 大概率是扫描件
-            avg_per_page = text_length / pages_to_check if pages_to_check > 0 else 0
-            return avg_per_page < 100
+            with fitz.open(stream=content, filetype="pdf") as doc:
+                text_length = 0
+                pages_to_check = min(3, len(doc))
+                for i in range(pages_to_check):
+                    text_length += len(doc[i].get_text("text").strip())
+                # 平均每页不到 100 字符 → 大概率是扫描件
+                avg_per_page = text_length / pages_to_check if pages_to_check > 0 else 0
+                return avg_per_page < 100
         except Exception:
             return True  # 出错时默认用 OCR
 
@@ -291,7 +291,7 @@ class PDFParser:
         """统计 PDF 总页数"""
         try:
             import fitz
-            doc = fitz.open(stream=content, filetype="pdf")
-            return len(doc)
+            with fitz.open(stream=content, filetype="pdf") as doc:
+                return len(doc)
         except Exception:
             return 0
