@@ -91,9 +91,12 @@ class MemoryManager:
     # 长记忆: 用户画像
     # ================================================================
 
-    def get_user_profile(self, user_id: str) -> dict:
+    def get_user_profile(self, user_id: str, role: str = "agent") -> dict:
         """
-        根据 user_id 查询 MySQL 构建用户画像
+        根据 user_id 查询 MySQL 构建用户画像（角色感知）
+
+        - customer: 只能加载自己的数据，user_id 必须匹配当前用户
+        - agent/underwriter: 可以指定任意 user_id 查看客户数据
 
         Returns:
             dict: {
@@ -170,7 +173,7 @@ class MemoryManager:
 
         if profile["has_data"]:
             logger.info(
-                f"用户画像: user_id={user_id} "
+                f"用户画像: user_id={user_id} role={role} "
                 f"policies={len(profile['policies'])} "
                 f"claims={len(profile['claims'])} "
                 f"({profile['queried_at']}s)"

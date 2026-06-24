@@ -283,7 +283,7 @@ class LLMClient:
             model=self.planner_model,
         )
 
-    def chat_json(self, messages: list[dict], temperature: float = 0) -> dict:
+    def chat_json(self, messages: list[dict], temperature: float = 0, max_tokens: int = None) -> dict:
         """
         调用 LLM 并解析 JSON 返回
 
@@ -301,7 +301,7 @@ class LLMClient:
         response = self.chat(
             messages=messages,
             temperature=temperature,
-            max_tokens=2048,
+            max_tokens=max_tokens or 2048,
             json_mode=True,
         )
 

@@ -80,14 +80,20 @@ class ComplianceGuard:
         response: str,
         context_chunks: list = None,
         intent: str = "",
+        user_role: str = "agent",
     ) -> ComplianceResult:
         """
-        对 LLM 生成的回复进行合规检查
+        对 LLM 生成的回复进行合规检查（角色感知）
+
+        - customer: 严格合规 — 所有检查 + 追加客户免责声明
+        - agent/underwriter: 宽松合规 — 跳过冗余声明，只查核心红线
+        - admin: 最宽松 — 仅检查监管敏感词
 
         Args:
             response: LLM 生成的回复文本
             context_chunks: 检索到的条款 chunks (用于验证金额引用)
             intent: 意图类型
+            user_role: 用户角色 (customer / agent / underwriter / admin)
 
         Returns:
             ComplianceResult: 合规检查结果
@@ -120,12 +126,24 @@ class ComplianceGuard:
         # ── 处理结果 ──
         if violated:
             modified = self._apply_fixes(response, violated, context_chunks)
+
+            # 内部人员: 单条轻微违规可修复放行
+            # 外部客户: 零容忍，任何违规都拦截
+            if user_role == "customer":
+                passed = False
+            else:
+                passed = len(violated) <= 1
+
             return ComplianceResult(
-                passed=len(violated) <= 1,  # 只有一条轻微违规可以通过修改修复
+                passed=passed,
                 violated_rules=violated,
                 modified_response=modified,
                 original_response=response,
             )
+
+        # ── 外部客户: 追加通用免责声明 ──
+        if user_role == "customer":
+            response = self._append_customer_disclaimer(response)
 
         return ComplianceResult(
             passed=True,
@@ -133,6 +151,21 @@ class ComplianceGuard:
             modified_response=response,
             original_response=response,
         )
+
+    # ============================================================
+    # 角色感知方法
+    # ============================================================
+
+    def _append_customer_disclaimer(self, response: str) -> str:
+        """外部客户通道追加通用合规声明"""
+        disclaimer = (
+            "\n\n---\n"
+            "⚠️ **温馨提示**：以上信息基于保险条款解读，仅供参考，"
+            "不构成投保建议或理赔承诺。具体保障范围、理赔条件及保费金额"
+            "以保险合同条款约定和保险公司正式审核为准。"
+            "如有疑问，请联系人工客服或拨打保险公司官方客服热线。"
+        )
+        return response.rstrip() + disclaimer
 
     # ============================================================
     # 各检查规则实现

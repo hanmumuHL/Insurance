@@ -75,12 +75,27 @@ class RedisConfig:
 
 
 @dataclass
+class Neo4jConfig:
+    uri: str = field(default_factory=lambda: _env("NEO4J_URI", "bolt://localhost:7687"))
+    user: str = field(default_factory=lambda: _env("NEO4J_USER", "neo4j"))
+    password: str = field(default_factory=lambda: _env("NEO4J_PASSWORD", "neo4j123"))
+
+
+@dataclass
 class ModelPaths:
     bge_m3: str = field(default_factory=lambda: _env("BGE_M3_MODEL_PATH", "models/bge-m3"))
     reranker: str = field(default_factory=lambda: _env("RERANKER_MODEL_PATH", "models/bge-reranker-large"))
-    bert_classifier: str = field(default_factory=lambda: _env("BERT_CLASSIFIER_PATH", "models/bert-base-chinese"))
+    bert_classifier: str = field(default_factory=lambda: _env("BERT_CLASSIFIER_PATH", "models/bert_intent"))
     bert_model_dir: str = field(default_factory=lambda: _env("BERT_MODEL_DIR", "models/bert_intent"))
     bert_segmenter: str = field(default_factory=lambda: _env("BERT_SEGMENTER_PATH", "models/nlp_bert_document-segmentation_chinese-base"))
+
+
+@dataclass
+class AuthConfig:
+    """双通道认证配置"""
+    auth_enabled: bool = field(default_factory=lambda: _env_bool("AUTH_ENABLED", True))
+    jwt_secret: str = field(default_factory=lambda: _env("JWT_SECRET", ""))
+    default_role: str = "agent"  # 未认证时的默认角色（向后兼容）
 
 
 @dataclass
@@ -89,7 +104,9 @@ class Settings:
     milvus: MilvusConfig = field(default_factory=MilvusConfig)
     mysql: MySQLConfig = field(default_factory=MySQLConfig)
     redis: RedisConfig = field(default_factory=RedisConfig)
+    neo4j: Neo4jConfig = field(default_factory=Neo4jConfig)
     models: ModelPaths = field(default_factory=ModelPaths)
+    auth: AuthConfig = field(default_factory=AuthConfig)
 
     # RAG 参数
     chunk_size: int = 512

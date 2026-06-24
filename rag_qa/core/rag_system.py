@@ -137,13 +137,14 @@ class RAGSystem:
     # 主入口: 处理一次完整的问答请求
     # ============================================================
 
-    def query(self, raw_query: str, session_id: str = "") -> RAGResponse:
+    def query(self, raw_query: str, session_id: str = "", user_role: str = "agent") -> RAGResponse:
         """
-        处理一次用户查询 — 完整 pipeline
+        处理一次用户查询 — 完整 pipeline（角色感知）
 
         Args:
             raw_query: 用户原始输入（未脱敏）
             session_id: 会话 ID（用于上下文关联）
+            user_role: 用户角色 (customer / agent / underwriter / admin)
 
         Returns:
             RAGResponse: 包含答案和中间过程信息的完整响应
@@ -169,7 +170,7 @@ class RAGSystem:
             # 不相关的问题直接拒绝，不走后续任何流程
             # 注: PII 脱敏由上游 Spring 网关完成，此处接收的已是脱敏后 query
             t0 = time.time()
-            guard_result = self.domain_guard.check(raw_query)
+            guard_result = self.domain_guard.check(raw_query, user_role=user_role)
             pipeline["domain_guard"] = round((time.time() - t0) * 1000, 1)
             if not guard_result.passed:
                 logger.info(f"领域守卫拦截: {guard_result.reason}")
@@ -252,6 +253,14 @@ class RAGSystem:
                 f"检索策略: {strategy_plan.strategy.value} | {strategy_plan.reason}"
             )
 
+            # ── 阶段 7.5: KG 推理增强 (可选) ──
+            # 当 query 包含疾病/产品等实体时，用 KG 推理增强检索过滤条件
+            t0 = time.time()
+            kg_context = self._kg_reasoning_enhance(raw_query, intent, entities)
+            pipeline["kg_reasoning"] = round((time.time() - t0) * 1000, 1)
+            if kg_context:
+                logger.info(f"KG 推理增强: {kg_context[:100]}...")
+
             # ── 阶段 8: Milvus 混合检索 (~30ms) ──
             t0 = time.time()
             chunks = self._do_retrieval(raw_query, strategy_plan)
@@ -273,12 +282,12 @@ class RAGSystem:
 
             # ── 阶段 10: LLM 生成答案 (~200ms) ──
             t0 = time.time()
-            answer = self._generate_answer(raw_query, chunks, intent)
+            answer = self._generate_answer(raw_query, chunks, intent, kg_context or "")
             pipeline["generation"] = round((time.time() - t0) * 1000, 1)
 
             # ── 阶段 11: 合规检查 ──
             t0 = time.time()
-            compliance = self.compliance_guard.check(answer, chunks, intent)
+            compliance = self.compliance_guard.check(answer, chunks, intent, user_role=user_role)
             pipeline["compliance"] = round((time.time() - t0) * 1000, 1)
             if not compliance.passed:
                 # 合规不通过 → 返回安全兜底话术，不使用修改后的文本
@@ -378,12 +387,46 @@ class RAGSystem:
     # 内部方法: LLM 调用
     # ============================================================
 
-    def _generate_answer(self, query: str, chunks: list, intent: str) -> str:
+    def _kg_reasoning_enhance(self, query: str, intent: str, entities: dict) -> str:
+        """
+        KG 推理增强 — 在检索前用知识图谱补全上下文
+
+        当 query 中包含疾病、产品等实体时:
+          1. 用 KGReasoner 推理关联实体
+          2. 推理路径作为额外上下文注入 LLM prompt
+          3. 帮助 LLM 理解复杂的保险概念关系
+
+        降级策略: KG 不可用或未命中时返回空字符串（不影响主流程）
+        """
+        try:
+            from rag_qa.core.kg_reasoner import KGReasoner
+
+            reasoner = KGReasoner()
+            paths = reasoner.reason_from_query(query)
+
+            if not paths:
+                return ""
+
+            # 构建推理摘要
+            parts = []
+            for i, path in enumerate(paths[:3]):  # 最多3条推理路径
+                parts.append(f"推理路径{i+1}: {path.explain()}")
+                for entity in path.entities_found[:3]:
+                    if entity.get("type") == "Product":
+                        parts.append(f"  关联产品: {entity.get('product_name', entity['name'])}")
+
+            return "\n".join(parts) if parts else ""
+
+        except Exception as e:
+            logger.debug(f"KG 推理增强跳过: {e}")
+            return ""
+
+    def _generate_answer(self, query: str, chunks: list, intent: str, kg_context: str = "") -> str:
         """
         调用 LLM 生成答案 — 主备切换模式
 
         流程:
-          1. 组装 prompt (system + context + user query)
+          1. 组装 prompt (system + KG context + 条款 context + user query)
           2. 调用 DeepSeek API (主)
           3. 如果 DeepSeek 超时/报错 → 降级到千问 API
           4. 如果千问也失败 → 返回兜底话术
@@ -392,6 +435,7 @@ class RAGSystem:
             query: 脱敏后的用户 query
             chunks: 检索到的条款 chunks
             intent: 意图类型
+            kg_context: KG 推理上下文（可选，用于增强回答）
 
         Returns:
             LLM 生成的答案文本
@@ -402,10 +446,17 @@ class RAGSystem:
         # ── 组装 system prompt ──
         system_prompt = self._build_system_prompt(intent)
 
+        # ── 组装 user message (KG 推理路径作为补充信息) ──
+        user_parts = [f"参考条款:\n{context}"]
+        if kg_context:
+            user_parts.insert(0, f"知识图谱推理:\n{kg_context}")
+        user_parts.append(f"用户问题: {query}")
+        user_message = "\n\n".join(user_parts)
+
         # ── 调用 LLM (主备切换) ──
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"参考条款:\n{context}\n\n用户问题: {query}"},
+            {"role": "user", "content": user_message},
         ]
 
         answer = self._llm_chat_with_fallback(messages)

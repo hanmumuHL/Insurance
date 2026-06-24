@@ -125,6 +125,9 @@ class AgentState:
     sources: list[dict] = field(default_factory=list)
     error: str = ""
 
+    # ── 角色 ──
+    user_role: str = "agent"
+
     # ── 监控 ──
     pipeline: dict = field(default_factory=dict)
 
@@ -163,6 +166,7 @@ class SubAgentTask:
     context: dict = field(default_factory=dict)
     dependencies: list[str] = field(default_factory=list)
     priority: int = 0
+    user_role: str = "agent"  # 角色: customer / agent / underwriter / admin
 
 
 @dataclass
