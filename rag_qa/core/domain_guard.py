@@ -50,8 +50,17 @@ class DomainBoundaryGuard:
 
     GREETING_RESPONSE = "您好！我是保险智能客服，请问有什么保险相关问题可以帮您？"
 
-    def check(self, query: str) -> GuardResult:
-        """检查 query 是否属于保险领域"""
+    def check(self, query: str, user_role: str = "agent") -> GuardResult:
+        """
+        检查 query 是否属于保险领域（角色感知）
+
+        - agent/underwriter/admin: 内部人员可问系统级/操作类问题，全部放行
+        - customer: 外部客户走完整检查
+        """
+        # ── 内部人员: 不限制领域 ──
+        if user_role in ("agent", "underwriter", "admin"):
+            return GuardResult(passed=True, reason="internal")
+
         query_lower = query.strip()
 
         # ── 太短 → 可能是闲聊 ──

@@ -1,16 +1,17 @@
 """
-BERT-BASE-CHINESE 保险意图分类器
+BERT-BASE-CHINESE 保险意图分类器 (LoRA 微调)
 
-架构: bert-base-chinese → Dropout → Linear(768 → 9)
+架构: bert-base-chinese → LoRA (r=8) → Dropout → Linear(768 → 9)
 9分类: 闲聊寒暄/条款解读/保单查询/理赔咨询/产品对比/保费试算/退保咨询/投诉建议/out_of_domain
 
 功能:
+  - LoRA 微调: 仅训练 ~0.3M 参数 (全量 110M 的 0.3%)，单卡秒级训练
   - 单例模式: get_bert_classifier()
-  - 延迟加载: 首次 predict() 时才加载模型（避免启动时 ~400MB 内存占用）
-  - 温度校准: 训练后用验证集搜索最优温度 T，推理时校准置信度
+  - 延迟加载: 首次 predict() 时才加载模型
+  - 温度校准: 训练后用验证集搜索最优温度 T
   - 批量预测: predict_batch() 10x 快于串行
   - LLM 扩增数据: generate_training_data() 用 DeepSeek 生成变体
-  - CLI 工具: --train / --evaluate / --predict / --generate-data
+  - merge_and_save: 合并 LoRA 到基座导出完整模型 (推理部署)
 
 使用:
   python -m rag_qa.core.bert_intent_classifier --predict "肺炎住院能赔吗"
@@ -18,11 +19,8 @@ BERT-BASE-CHINESE 保险意图分类器
 """
 
 import json
-import math
 import os
-import sys
 import threading
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -31,10 +29,15 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
-    AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     get_linear_schedule_with_warmup,
+)
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    PeftModel,
+    TaskType,
 )
 
 from base.logger import logger
@@ -77,6 +80,12 @@ class IntentDataset(Dataset):
 class BERTIntentClassifier:
     """BERT-BASE-CHINESE 意图分类器"""
 
+    # ── LoRA 超参数 ─────────────────────────
+    LORA_R = 8
+    LORA_ALPHA = 16
+    LORA_DROPOUT = 0.1
+    LORA_TARGET_MODULES = ["query", "value"]
+
     def __init__(self, model_path: str = None):
         self.model_path = model_path or settings.models.bert_classifier
         self.model = None
@@ -85,47 +94,86 @@ class BERTIntentClassifier:
         self._loaded = False
         self._temperature = 1.0
         self._lock = threading.Lock()
+        self._is_lora = False  # True = PeftModel wrapper, False = merged/raw model
 
     # ── 懒加载 ──────────────────────────────
 
     def load(self, model_dir: str = None):
-        """延迟加载模型，首次 predict/train 时自动触发"""
+        """延迟加载模型，首次 predict/train 时自动触发
+
+        加载优先级:
+          1. 已合并的完整模型 (config.json 存在，无 adapter_config.json)
+          2. LoRA adapter (adapter_config.json 存在) → 加载基座+adapter
+          3. 预训练基座 (从 HuggingFace 或本地) → 创建新 LoRA wrapper
+        """
         if self._loaded:
             return
 
         path = model_dir or self.model_path
 
         try:
-            # 尝试从微调模型目录加载
-            if (
-                path
-                and os.path.isdir(path)
-                and os.path.exists(os.path.join(path, "config.json"))
-            ):
-                logger.info(f"[BERT] 从微调模型加载: {path}")
-                self.model = AutoModelForSequenceClassification.from_pretrained(path)
-                self.tokenizer = AutoTokenizer.from_pretrained(path)
-                # 加载温度参数
-                temp_path = os.path.join(path, "temperature.json")
-                if os.path.exists(temp_path):
-                    with open(temp_path) as f:
-                        self._temperature = json.load(f).get("temperature", 1.0)
-            else:
-                # 从 HuggingFace 下载预训练 bert-base-chinese
-                logger.info(f"[BERT] 从 HuggingFace 加载: {path}")
-                config = AutoConfig.from_pretrained(path, num_labels=NUM_LABELS)
-                config.id2label = ID2LABEL
-                config.label2id = LABEL2ID
+            adapter_config = os.path.join(path, "adapter_config.json") if os.path.isdir(path) else None
+            full_config = os.path.join(path, "config.json") if os.path.isdir(path) else None
+
+            # ── Case 1: 已合并的完整微调模型 ──
+            if full_config and os.path.exists(full_config) and not (adapter_config and os.path.exists(adapter_config)):
+                logger.info(f"[BERT] 从完整模型加载: {path}")
                 self.model = AutoModelForSequenceClassification.from_pretrained(
-                    path, config=config
+                    path, num_labels=NUM_LABELS, ignore_mismatched_sizes=True
                 )
                 self.tokenizer = AutoTokenizer.from_pretrained(path)
+                self._is_lora = False
+
+            # ── Case 2: LoRA adapter (保存的 adapter) ──
+            elif adapter_config and os.path.exists(adapter_config):
+                logger.info(f"[BERT] 从 LoRA adapter 加载: {path}")
+                base_path = settings.models.bert_classifier  # 基座路径
+                # 尝试从同目录找基座，否则用默认路径
+                base_config = os.path.join(path, "base_model_config.json")
+                if os.path.exists(base_config):
+                    with open(base_config) as f:
+                        base_path = json.load(f).get("base_model", base_path)
+
+                base_model = AutoModelForSequenceClassification.from_pretrained(
+                    base_path, num_labels=NUM_LABELS, ignore_mismatched_sizes=True
+                )
+                self.model = PeftModel.from_pretrained(base_model, path)
+                self.tokenizer = AutoTokenizer.from_pretrained(path)
+                self._is_lora = True
+
+            # ── Case 3: 预训练基座 → 创建 LoRA wrapper ──
+            else:
+                logger.info(f"[BERT] 从基座加载并创建 LoRA: {path}")
+                base_model = AutoModelForSequenceClassification.from_pretrained(
+                    path, num_labels=NUM_LABELS, ignore_mismatched_sizes=True
+                )
+                lora_config = LoraConfig(
+                    r=self.LORA_R,
+                    lora_alpha=self.LORA_ALPHA,
+                    lora_dropout=self.LORA_DROPOUT,
+                    target_modules=self.LORA_TARGET_MODULES,
+                    bias="none",
+                    task_type=TaskType.SEQ_CLS,
+                )
+                self.model = get_peft_model(base_model, lora_config)
+                self.tokenizer = AutoTokenizer.from_pretrained(path)
+                self._is_lora = True
+
+            # ── 加载温度参数 ──
+            temp_path = os.path.join(path, "temperature.json") if os.path.isdir(path) else None
+            if temp_path and os.path.exists(temp_path):
+                with open(temp_path) as f:
+                    self._temperature = json.load(f).get("temperature", 1.0)
 
             self.model.to(self.device)
             self.model.eval()
             self._loaded = True
+
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.model.parameters())
             logger.info(
-                f"[BERT] 模型加载完成 device={self.device} temp={self._temperature:.2f}"
+                f"[BERT] 加载完成 device={self.device} temp={self._temperature:.2f} "
+                f"lora={self._is_lora} trainable={trainable}/{total} ({100*trainable/total:.1f}%)"
             )
         except Exception as e:
             logger.error(f"[BERT] 模型加载失败: {e}")
@@ -203,13 +251,29 @@ class BERTIntentClassifier:
         labels: list[str],
         epochs: int = 5,
         batch_size: int = 16,
-        learning_rate: float = 2e-5,
+        learning_rate: float = 2e-4,
         eval_split: float = 0.1,
         save_path: str = None,
     ):
-        """微调 BERT 分类器"""
+        """LoRA 微调 BERT 分类器（仅训练 adapter 参数）
+
+        Args:
+            learning_rate: LoRA 推荐 1e-4 ~ 5e-4 (高于全量微调的 2e-5)
+        """
         if not self._loaded:
             self.load()
+
+        # 确保模型在 LoRA 模式下
+        if not self._is_lora:
+            logger.info("[BERT] 模型非 LoRA，重新包装...")
+            lora_config = LoraConfig(
+                r=self.LORA_R, lora_alpha=self.LORA_ALPHA,
+                lora_dropout=self.LORA_DROPOUT,
+                target_modules=self.LORA_TARGET_MODULES,
+                bias="none", task_type=TaskType.SEQ_CLS,
+            )
+            self.model = get_peft_model(self.model, lora_config)
+            self._is_lora = True
 
         # 数据划分
         from sklearn.model_selection import train_test_split
@@ -225,14 +289,14 @@ class BERTIntentClassifier:
         train_dataset = IntentDataset(train_texts, train_labels, self.tokenizer)
         eval_dataset = (
             IntentDataset(eval_texts, eval_labels, self.tokenizer)
-            if eval_texts
-            else None
+            if eval_texts else None
         )
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-        # 优化器 + 调度器
-        optimizer = AdamW(self.model.parameters(), lr=learning_rate)
+        # LoRA: 仅优化可训练参数 (~0.3M)
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable_params, lr=learning_rate)
         total_steps = len(train_loader) * epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
@@ -243,8 +307,10 @@ class BERTIntentClassifier:
         self.model.train()
         self.model.to(self.device)
 
+        trainable_count = sum(p.numel() for p in trainable_params)
         logger.info(
-            f"[BERT] 开始训练 epochs={epochs} samples={len(train_texts)} batch={batch_size}"
+            f"[BERT] LoRA训练 epochs={epochs} samples={len(train_texts)} "
+            f"batch={batch_size} lr={learning_rate} trainable={trainable_count}"
         )
 
         for epoch in range(epochs):
@@ -261,15 +327,14 @@ class BERTIntentClassifier:
 
             avg_loss = total_loss / len(train_loader)
 
-            # 验证
             eval_acc = 0
             if eval_dataset:
                 eval_acc = self._evaluate_dataset(eval_dataset)
                 logger.info(
-                    f"[BERT] Epoch {epoch + 1}/{epochs} loss={avg_loss:.4f} eval_acc={eval_acc:.3f}"
+                    f"[BERT] Epoch {epoch+1}/{epochs} loss={avg_loss:.4f} eval_acc={eval_acc:.3f}"
                 )
             else:
-                logger.info(f"[BERT] Epoch {epoch + 1}/{epochs} loss={avg_loss:.4f}")
+                logger.info(f"[BERT] Epoch {epoch+1}/{epochs} loss={avg_loss:.4f}")
 
         self.model.eval()
 
@@ -278,15 +343,14 @@ class BERTIntentClassifier:
             self._temperature = self._calibrate_temperature(eval_dataset)
             logger.info(f"[BERT] 温度校准: T={self._temperature:.3f}")
 
-        # 保存
+        # 保存 LoRA adapter
         if save_path:
             self._save(save_path)
-            logger.info(f"[BERT] 模型已保存到 {save_path}")
+            logger.info(f"[BERT] LoRA adapter 已保存到 {save_path}")
 
     def _evaluate_dataset(self, dataset: IntentDataset) -> float:
         loader = DataLoader(dataset, batch_size=32)
-        correct = 0
-        total = 0
+        correct, total = 0, 0
         with torch.no_grad():
             for batch in loader:
                 labels = batch.pop("labels").to(self.device)
@@ -298,11 +362,8 @@ class BERTIntentClassifier:
         return correct / total if total > 0 else 0
 
     def _calibrate_temperature(self, dataset: IntentDataset) -> float:
-        """在验证集上搜索最优温度参数（最小化 NLL）"""
         loader = DataLoader(dataset, batch_size=32)
-
-        all_logits = []
-        all_labels = []
+        all_logits, all_labels = [], []
         with torch.no_grad():
             for batch in loader:
                 labels = batch.pop("labels").to(self.device)
@@ -310,35 +371,59 @@ class BERTIntentClassifier:
                 outputs = self.model(**batch)
                 all_logits.append(outputs.logits.cpu())
                 all_labels.append(labels)
+        logits = torch.cat(all_logits, dim=0).cpu()
+        labels = torch.cat(all_labels, dim=0).cpu()
 
-        logits = torch.cat(all_logits, dim=0)
-        labels = torch.cat(all_labels, dim=0)
-
-        temperatures = np.logspace(-0.5, 0.5, 20)
-        best_temp = 1.0
-        best_nll = float("inf")
-
-        for t in temperatures:
-            scaled = logits / t
-            probs = F.softmax(scaled, dim=1)
+        best_temp, best_nll = 1.0, float("inf")
+        for t in np.logspace(-0.5, 0.5, 20):
+            probs = F.softmax(logits / t, dim=1)
             nll = F.nll_loss(torch.log(probs + 1e-8), labels).item()
             if nll < best_nll:
-                best_nll = nll
-                best_temp = t
-
+                best_nll, best_temp = nll, t
         return best_temp
 
     def _save(self, save_path: str):
-        """保存微调模型、tokenizer、温度参数"""
+        """保存 LoRA adapter + tokenizer + 温度参数"""
         os.makedirs(save_path, exist_ok=True)
-        self.model.save_pretrained(save_path)
+        if self._is_lora:
+            self.model.save_pretrained(save_path)
+        else:
+            self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)
+        # 记录基座路径
+        with open(os.path.join(save_path, "base_model_config.json"), "w") as f:
+            json.dump({"base_model": settings.models.bert_classifier}, f)
         with open(os.path.join(save_path, "temperature.json"), "w") as f:
             json.dump({"temperature": self._temperature}, f)
 
+    def merge_and_save(self, save_path: str):
+        """合并 LoRA adapter 到基座模型并保存为完整模型
+
+        用于推理部署: 合并后无需 peft 依赖，直接 AutoModel 加载。
+        """
+        if not self._is_lora:
+            logger.info("[BERT] 模型已是完整模型，直接保存")
+            self.model.save_pretrained(save_path)
+            self.tokenizer.save_pretrained(save_path)
+            return
+
+        logger.info("[BERT] 合并 LoRA → 完整模型...")
+        merged = self.model.merge_and_unload()
+        merged.save_pretrained(save_path)
+        self.tokenizer.save_pretrained(save_path)
+        # 删除旧 adapter 文件，避免 load() 误判为 LoRA adapter
+        for f in ["adapter_config.json", "adapter_model.safetensors",
+                   "adapter_model.bin", "base_model_config.json"]:
+            fp = os.path.join(save_path, f)
+            if os.path.exists(fp):
+                os.remove(fp)
+        with open(os.path.join(save_path, "temperature.json"), "w") as f:
+            json.dump({"temperature": self._temperature}, f)
+        logger.info(f"[BERT] 合并模型已保存到 {save_path}")
+
     @classmethod
     def from_pretrained(cls, path: str) -> "BERTIntentClassifier":
-        """从本地微调模型加载（秒级）"""
+        """从本地模型加载（支持完整模型或 LoRA adapter）"""
         instance = cls(model_path=path)
         instance.load(model_dir=path)
         return instance

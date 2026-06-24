@@ -1,6 +1,10 @@
-# 保险聚合平台 — RAG 智能问答 + 多智能体编排系统
+# 保险聚合平台 — RAG 智能问答 + 多智能体编排 · 双通道架构
 
-面向保险聚合场景（对接多家保险公司、200+ 产品）的智能客服与 Agent 系统。从 RAG 问答到多智能体编排，历经三次架构迭代，形成一套生产就绪的 AI 服务框架。
+面向保险聚合场景（对接多家保险公司、200+ 产品）的 AI 助手系统。支持**内外双通道**：
+- **Customer 通道**：外部客户自助问答（RAG Pipeline）— 轻量、快速、严格合规
+- **Agent 通道**：内部保险顾问 AI 助手（Multi-Agent 编排）— 完整数据、专业决策
+
+从 RAG 问答到多智能体编排，历经三次架构迭代，形成一套生产就绪的 AI 服务框架。对标明亚 MyBA、人保 AI 保宝等行业主流双通道架构。
 
 ---
 
@@ -8,10 +12,10 @@
 
 |  |  |  |
 |---|---|---|
-| **14 阶段 RAG Pipeline** | **多智能体编排** | **三级缓存策略** |
-| BGE-M3 混合检索 + Reranker 重排序 + 质量门控 + 合规审查 | Orchestrator 统一调度 4 个领域 Agent | Redis L1 → Milvus L2 → MySQL L3，全链路缓存 |
-| **双模型故障转移** | **中文 PII 脱敏** | **10 种设计模式** |
-| DeepSeek 主 + 通义千问降级 + Circuit Breaker | 身份证/手机号/保单号等 6 类敏感信息脱敏与恢复 | Singleton、Strategy、Template Method、Chain of Responsibility 等 |
+| **双通道架构** | **14 阶段 RAG Pipeline** | **多智能体编排** |
+| 同一 AI 底座，按角色分流：外部客户走轻量 RAG，内部顾问走 Multi-Agent | BGE-M3 混合检索 + Reranker 重排序 + 质量门控 + 合规审查 | Orchestrator 统一调度 4 个领域 Agent |
+| **双模型故障转移** | **角色感知合规** | **10 种设计模式** |
+| DeepSeek 主 + 通义千问降级 + Circuit Breaker | Customer 严格合规 + 免责声明；Agent 宽松合规 | Singleton、Strategy、Template Method、Chain of Responsibility 等 |
 
 ---
 
@@ -46,11 +50,16 @@ Phase 2 ── RAG 智能客服
   ├── Parent-Child 分块（子块检索 + 父块增强）
   └── 质量门控 + 合规审查
 
-Phase 3 ── 多 Agent 编排（当前）
+Phase 3 ── 多 Agent 编排
   ├── Orchestrator 统一路由与任务编排
   ├── 4 个领域 SubAgent（保险/核保/理赔/客服）
   ├── 每个 Agent 独立 LangGraph、Tools、Compliance Rules
   └── 依赖式多 Agent 协作（上游结果注入下游 Context）
+
+Phase 4 ── 双通道架构（当前）
+  ├── Customer 通道: RAG Pipeline → 轻量快速、仅看自己数据、严格合规
+  ├── Agent 通道: Multi-Agent → 完整编排、全量数据、角色感知工具集
+  └── 共享 AI 底座: Milvus · MySQL · Redis · 双 LLM 故障转移
 ```
 
 ---
@@ -199,11 +208,51 @@ curl -X POST http://localhost:8000/admin/ingest \
 
 ## API 接口
 
-| 方法 | 路径 | 说明 |
+| 方法 | 路径 | 说明 | 权限 |
+|---|---|---|---|
+| POST | `/chat` | 统一问答入口，按 X-User-Role 自动分流 | Customer / Agent |
+| GET | `/chat/stream` | SSE 流式推送（Customer 通道追加免责声明） | Customer / Agent |
+| POST | `/admin/ingest` | PDF 文档导入 | **仅 ADMIN** |
+| GET | `/health` | 健康检查 | 公开 |
+
+### 双通道 Headers
+
+| Header | 说明 | 示例 |
 |---|---|---|
-| POST | `/chat` | 统一问答入口，自动路由到 RAG / 单 Agent / 多 Agent |
-| GET | `/chat/stream` | SSE 流式推送（state → answer → sources → done） |
-| POST | `/admin/ingest` | PDF 文档导入 |
-| GET | `/health` | 健康检查 |
+| `X-User-Id` | 用户唯一标识 | `cust_001` / `agent_042` |
+| `X-User-Role` | 角色 | `customer` / `agent` / `underwriter` / `admin` |
+| `X-Org-Id` | 所属机构（可选） | `pingan` / `zhongan` |
+
+### 双通道架构图
+
+```
+         X-User-Id / X-User-Role（上游 API Gateway 注入）
+                          │
+               ┌──────────▼──────────┐
+               │   Auth Middleware     │
+               │   get_current_user()  │
+               └──────────┬──────────┘
+                          │
+         ┌────────────────┼────────────────┐
+         │                                 │
+┌────────▼────────┐              ┌────────▼────────┐
+│ CUSTOMER 通道    │              │ AGENT 通道       │
+│ role=customer    │              │ role=agent/uw    │
+├─────────────────┤              ├─────────────────┤
+│ · RAG Pipeline  │              │ · Multi-Agent    │
+│ · 只看自己保单   │              │ · 查询任意客户   │
+│ · 严格合规+免责  │              │ · 宽松合规       │
+│ · 通俗回答       │              │ · 完整数据       │
+│ · 无内部工具     │              │ · 全量工具集     │
+└────────┬────────┘              └────────┬────────┘
+         │                                 │
+         └────────────────┬────────────────┘
+                          │
+               ┌──────────▼──────────┐
+               │  共享 AI 基础设施    │
+               │  Milvus · MySQL ·    │
+               │  Redis · LLM Pool    │
+               └─────────────────────┘
+```
 
 ---

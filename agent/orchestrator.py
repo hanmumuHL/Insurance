@@ -172,6 +172,7 @@ class Orchestrator:
         entities: dict = None,
         session_id: str = "",
         user_profile: dict = None,
+        user_role: str = "agent",
     ) -> dict:
         """
         处理用户请求 — 完整的多 Agent 协作流程
@@ -182,6 +183,7 @@ class Orchestrator:
             entities: 提取的实体 (如 {"insurer": "平安", "product_name": "e生保"})
             session_id: 会话 ID
             user_profile: 长期记忆中的用户画像
+            user_role: 用户角色 (customer / agent / underwriter / admin)
 
         Returns:
             dict: {
@@ -219,13 +221,13 @@ class Orchestrator:
         # ── Step 3: 构建任务列表 ──
         t2 = time.time()
         tasks = self._build_tasks(
-            query, intent, entities or {}, route, user_profile or {}
+            query, intent, entities or {}, route, user_profile or {}, user_role
         )
         pipeline["task_build"] = round((time.time() - t2) * 1000, 1)
 
         # ── Step 4: 执行任务 (按依赖顺序) ──
         t3 = time.time()
-        results = self._execute_tasks(tasks, session_id)
+        results = self._execute_tasks(tasks, session_id, user_role)
         pipeline["execution"] = round((time.time() - t3) * 1000, 1)
 
         # ── Step 5: 聚合结果 ──
@@ -365,6 +367,7 @@ class Orchestrator:
         entities: dict,
         route: dict,
         user_profile: dict,
+        user_role: str = "agent",
     ) -> list[SubAgentTask]:
         """
         将用户请求拆解为子 Agent 任务列表
@@ -375,6 +378,9 @@ class Orchestrator:
         """
         tasks = []
 
+        # ── KG 推理增强 (复杂意图注入知识图谱上下文) ──
+        kg_context = self._get_kg_context(query, intent)
+
         # ── 主 Agent 任务 ──
         primary = SubAgentTask(
             task_id="task_0",
@@ -382,9 +388,13 @@ class Orchestrator:
             intent=intent,
             user_query=query,
             entities=entities,
-            context={"user_profile": user_profile},
-            dependencies=[],  # 无依赖，第一个执行
+            context={
+                "user_profile": user_profile,
+                "kg_reasoning": kg_context,
+            },
+            dependencies=[],
             priority=10,
+            user_role=user_role,
         )
         tasks.append(primary)
         logger.info(
@@ -402,9 +412,11 @@ class Orchestrator:
                 context={
                     "user_profile": user_profile,
                     "awaiting_result_from": "task_0",
+                    "kg_reasoning": kg_context,
                 },
-                dependencies=["task_0"],  # 依赖主 Agent 完成
+                dependencies=["task_0"],
                 priority=5,
+                user_role=user_role,
             )
             tasks.append(secondary)
             logger.info(
@@ -412,6 +424,49 @@ class Orchestrator:
             )
 
         return tasks
+
+    def _get_kg_context(self, query: str, intent: str) -> str:
+        """
+        为复杂意图获取知识图谱推理上下文
+
+        当意图是理赔咨询/产品对比/核保咨询时，用 KG 推理
+        补全产品-疾病-条款的关系链，帮助 Agent 做出更准确的判断。
+
+        Args:
+            query: 用户 query
+            intent: 意图类型
+
+        Returns:
+            KG 推理上下文字符串，或空字符串
+        """
+        # 仅对复杂意图启用 KG 推理
+        complex_intents = {"理赔咨询", "产品对比", "核保咨询", "条款解读"}
+        if intent not in complex_intents:
+            return ""
+
+        try:
+            from rag_qa.core.kg_reasoner import KGReasoner
+
+            reasoner = KGReasoner()
+            paths = reasoner.reason_from_query(query)
+
+            if not paths:
+                return ""
+
+            parts = ["[知识图谱推理结果]"]
+            for i, path in enumerate(paths[:3]):
+                parts.append(f"  {path.explain()}")
+                for entity in path.entities_found[:3]:
+                    etype = entity.get("type", "")
+                    ename = entity.get("product_name") or entity.get("disease") or entity["name"]
+                    if etype == "Product":
+                        parts.append(f"    → 关联产品: {ename}")
+
+            return "\n".join(parts)
+
+        except Exception as e:
+            logger.debug(f"[Orchestrator] KG 推理跳过: {e}")
+            return ""
 
     def _derive_secondary_intent(
         self, primary_intent: str, secondary_agent: str
@@ -443,7 +498,7 @@ class Orchestrator:
     # 任务执行
     # ================================================================
 
-    def _execute_tasks(self, tasks: list[SubAgentTask], session_id: str) -> dict:
+    def _execute_tasks(self, tasks: list[SubAgentTask], session_id: str, user_role: str = "agent") -> dict:
         """
         按依赖顺序执行任务
 
@@ -511,7 +566,8 @@ class Orchestrator:
                     "context": task.context,
                     "entities": task.entities,
                     "session_id": session_id,
-                }
+                },
+                user_role=user_role,
             )
 
             results[task.task_id] = result

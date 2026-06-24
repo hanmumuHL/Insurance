@@ -84,14 +84,20 @@ class SubAgent(ABC):
     # ================================================================
 
     @abstractmethod
-    def _get_system_prompt(self) -> str:
+    def _get_system_prompt(self, role: str = "agent") -> str:
         """
-        领域专属 System Prompt
+        领域专属 System Prompt（角色感知）
 
         定义该 Agent 的"人设":
           - 职责边界 (能做什么、不能做什么)
           - 专业知识 (该领域特有的术语和规则)
           - 回答风格 (正式/亲切/简洁)
+
+        Args:
+            role: 用户角色
+                "customer"     → 外部客户: 通俗语言、严格合规
+                "agent"        → 内部顾问: 完整数据、专业技术语言
+                "underwriter"  → 核保人员: 核保规则、风险评估
 
         Orchestrator 在构建 Planner Prompt 时会把这个 prompt 作为前缀。
         """
@@ -164,9 +170,9 @@ class SubAgent(ABC):
     # 主入口: invoke(task) → SubAgentResult
     # ================================================================
 
-    def invoke(self, task: dict) -> SubAgentResult:
+    def invoke(self, task: dict, user_role: str = "agent") -> SubAgentResult:
         """
-        执行子 Agent 任务（支持跨轮对话记忆）
+        执行子 Agent 任务（支持跨轮对话记忆 + 角色感知）
 
         Args:
             task: {
@@ -177,6 +183,7 @@ class SubAgent(ABC):
                 "entities": dict,      # 提取的实体
                 "session_id": str,     # 会话 ID → 用作 thread_id 恢复历史
             }
+            user_role: 用户角色 (customer / agent / underwriter / admin)
 
         Returns:
             SubAgentResult: 统一格式的执行结果
@@ -187,15 +194,13 @@ class SubAgent(ABC):
         session_id = task.get("session_id", "")
 
         # ── 构造初始状态 ──
-        # 注意: messages 字段使用 LangGraph add_messages annotator，
-        # 如果 checkpointer 生效，同 thread_id 的旧 messages 会自动恢复。
-        # 这里只传当前轮的用户消息，历史消息由 checkpointer 自动合并。
         initial_state = {
             "user_query": task.get("user_query", ""),
             "intent": task.get("intent", ""),
             "entities": task.get("entities", {}),
             "context": task.get("context", {}),
             "session_id": session_id,
+            "user_role": user_role,
             "iteration": 0,
             "max_iterations": 3,
             "messages": [],
@@ -323,11 +328,14 @@ class SubAgent(ABC):
         if profile_summary:
             memory_context += f"\n{profile_summary}\n"
 
-        planner_prompt = f"""{self._get_system_prompt()}
+        user_role = state.get("user_role", "agent")
+
+        planner_prompt = f"""{self._get_system_prompt(role=user_role)}
 
 用户问题: {query}
 用户意图: {intent}
 提取实体: {entities}
+用户角色: {user_role}
 {memory_context}
 附加上下文:
 {context}
@@ -546,10 +554,12 @@ class SubAgent(ABC):
 5. 如果用户问题与历史对话相关，保持回应的连贯性
 """
 
+        user_role = state.get("user_role", "agent")
+
         client = get_llm_client()
         response = client.chat(
             messages=[
-                {"role": "system", "content": self._get_system_prompt()},
+                {"role": "system", "content": self._get_system_prompt(role=user_role)},
                 {"role": "user", "content": synthesize_prompt},
             ],
             temperature=0.3,

@@ -139,7 +139,7 @@ class QueryClassifier:
     def _bert_classify(self, query: str) -> IntentResult | None:
         """第2层: BERT 分类"""
         try:
-            # 假设 bert_model 有 predict 方法
+            # 调用 BERTIntentClassifier.predict() → {"intent": "...", "confidence": 0.xx}
             pred = self.bert_model.predict(query)
             intent = pred["intent"]
             confidence = pred["confidence"]
@@ -213,14 +213,46 @@ class QueryClassifier:
             return None
 
     def _extract_entities(self, query: str) -> dict:
-        """从 query 中提取实体（保司/产品名）"""
+        """
+        从 query 中提取实体（保司/产品名/疾病/事件）
+
+        优先使用 KG 实体链接器（支持疾病、事件等更多实体类型），
+        降级时回退到正则匹配。
+        """
+        # ── 尝试 KG 实体链接 ──
+        try:
+            from rag_qa.core.kg_entity_linker import KGEntityLinker
+            linker = KGEntityLinker()
+            kg_result = linker.link(query)
+
+            entities = {}
+            if kg_result.get("insurer"):
+                entities["insurer"] = kg_result["insurer"]
+            if kg_result.get("product"):
+                entities["product_name"] = kg_result["product"]
+            if kg_result.get("products") and len(kg_result["products"]) > 1:
+                entities["products"] = kg_result["products"]
+            if kg_result.get("disease"):
+                entities["disease"] = kg_result["disease"]
+            if kg_result.get("disease_category"):
+                entities["disease_category"] = kg_result["disease_category"]
+            if kg_result.get("event"):
+                entities["event"] = kg_result["event"]
+            if kg_result.get("dimensions"):
+                entities["dimensions"] = kg_result["dimensions"]
+
+            if entities:
+                return entities
+        except Exception as e:
+            logger.debug(f"KG 实体链接不可用，回退到正则: {e}")
+
+        # ── 回退: 正则匹配 ──
         entities = {}
         insurers = ["平安", "众安", "太平洋", "人保", "太平", "阳光", "泰康", "新华", "友邦"]
         for ins in insurers:
             if ins in query:
                 entities["insurer"] = ins
                 break
-        # 产品名模式：XX保、XX生、XXe生
         product_patterns = [
             r"([\u4e00-\u9fa5a-zA-Z]{2,10}(?:保|生|e生|尊享|守护))",
         ]
@@ -230,3 +262,4 @@ class QueryClassifier:
                 entities["product_name"] = m.group(1)
                 break
         return entities
+

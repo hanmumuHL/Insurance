@@ -47,10 +47,15 @@ class PolicyQueryTool(BaseTool):
 
     # ── 依赖注入 ──
     mysql_session: Optional[object] = None  # MySQL 连接会话
+    user_context: Optional[object] = None   # UserContext（角色感知数据隔离）
 
     def _run(self, insurer: str = "", product_name: str = "", user_id: str = "") -> str:
         """
         查询保单信息
+
+        数据隔离:
+          - customer 角色: 强制使用自己的 user_id，只能查自己的保单
+          - agent/underwriter 角色: 可以指定任意 user_id 查询
 
         SQL 逻辑:
           SELECT policy_no_masked, insurer, product_name, status,
@@ -62,6 +67,12 @@ class PolicyQueryTool(BaseTool):
           LIMIT 5
         """
         logger.info(f"工具调用: policy_query(insurer={insurer}, product={product_name})")
+
+        # ── 数据隔离: 外部客户只能查自己 ──
+        if self.user_context is not None and hasattr(self.user_context, 'is_customer'):
+            if self.user_context.is_customer:
+                user_id = self.user_context.user_id
+                logger.debug(f"[Security] Customer 数据隔离: 强制 user_id={user_id}")
 
         if self.mysql_session is None:
             return self._fallback(insurer, product_name)
@@ -827,8 +838,21 @@ def get_tool_by_name(name: str, **deps) -> Optional[BaseTool]:
 
 
 # ============================================================
-# 多 Agent 工具分组 — 按领域返回工具集 (Phase 3)
+# 多 Agent 工具分组 — 按领域 + 角色返回工具集 (Phase 3)
 # ============================================================
+
+# 工具 → 角色映射表（双通道权限隔离）
+# 外部客户 (customer): 只能查看自己的数据，不可使用内部工具
+# 内部人员 (agent/underwriter): 可使用全部工具
+TOOL_ROLE_MAP = {
+    "policy_query":       ["customer", "agent", "underwriter"],
+    "claim_eligibility":  ["agent", "underwriter"],       # 客户不可用（内部理赔预检）
+    "clause_search":      ["customer", "agent", "underwriter"],
+    "premium_calc":       ["agent", "underwriter"],        # 客户不可用（精确保费计算）
+    "product_compare":    ["customer", "agent"],
+    "claim_tracking":     ["customer", "agent"],           # 客户可查自己
+    "human_handoff":      ["agent", "underwriter"],        # 客户不可用（内部转接）
+}
 
 # 工具 → 领域映射表
 # 每个工具可以属于多个领域（一个工具被多个 Agent 共用）
@@ -858,34 +882,34 @@ def get_tools_by_domain(
     mysql_session=None,
     redis_session=None,
     llm_client=None,
+    user_context=None,
+    user_role: str = "agent",
 ) -> list:
     """
-    按业务领域返回工具集 — 多 Agent 架构核心函数
+    按业务领域 + 角色返回工具集 — 双通道架构核心函数
 
-    每个子 Agent 调用此函数获取本领域的工具，
-    而不是拿到全部 7 个工具。好处:
+    每个子 Agent 调用此函数获取本领域 + 本角色可用的工具。
+    好处:
       1. Planner 只需要在 3-5 个工具中做选择（而非 7 个）
       2. 每个领域的 Prompt 更聚焦
       3. 新增工具时只需改映射表，不改子 Agent 代码
+      4. 角色权限隔离: customer 看不到 internal 工具
 
     Args:
         domain: 领域名称
-            "insurance"     → 投保 Agent 工具 (product_compare, premium_calc, clause_search, human_handoff)
-            "underwriting"  → 核保 Agent 工具 (clause_search, human_handoff)
-            "claim"         → 理赔 Agent 工具 (policy_query, clause_search, claim_eligibility, claim_tracking, premium_calc, human_handoff)
-            "service"       → 客服 Agent 工具 (policy_query, human_handoff)
+            "insurance"     → 投保 Agent 工具
+            "underwriting"  → 核保 Agent 工具
+            "claim"         → 理赔 Agent 工具
+            "service"       → 客服 Agent 工具
         vector_store: VectorStore 实例
         mysql_session: MySQL 会话
         redis_session: Redis 客户端
         llm_client: LLM 客户端
+        user_context: UserContext 实例（用于数据隔离）
+        user_role: 用户角色 (customer / agent / underwriter / admin)
 
     Returns:
-        list[BaseTool]: 该领域的工具列表
-
-    Example:
-        tools = get_tools_by_domain("claim", vector_store=vs, mysql_session=db)
-        # → [PolicyQueryTool, ClauseSearchTool, ClaimEligibilityTool,
-        #     ClaimTrackingTool, HumanHandoffTool]
+        list[BaseTool]: 该领域 + 该角色可用的工具列表
     """
     from base.logger import logger
 
@@ -897,19 +921,30 @@ def get_tools_by_domain(
         llm_client=llm_client,
     )
 
-    # 按领域过滤
+    # ── 按领域过滤 ──
     domain_tools = []
     for tool in all_tools:
         tool_name = tool.name
         if tool_name in TOOL_DOMAIN_MAP and domain in TOOL_DOMAIN_MAP[tool_name]:
             domain_tools.append(tool)
 
+    # ── 按角色过滤（双通道权限隔离）──
+    role_tools = []
+    for tool in domain_tools:
+        tool_name = tool.name
+        if tool_name in TOOL_ROLE_MAP and user_role in TOOL_ROLE_MAP[tool_name]:
+            # 注入 UserContext（用于数据隔离）
+            if user_context is not None and hasattr(tool, 'user_context'):
+                tool.user_context = user_context
+            role_tools.append(tool)
+
     logger.info(
-        f"[Tools] 领域 '{domain}' → {len(domain_tools)} 个工具: "
-        f"{[t.name for t in domain_tools]}"
+        f"[Tools] 领域 '{domain}' + 角色 '{user_role}' → "
+        f"{len(role_tools)}/{len(domain_tools)} 个工具: "
+        f"{[t.name for t in role_tools]}"
     )
 
-    return domain_tools
+    return role_tools
 
 
 _global_deps: dict = {}

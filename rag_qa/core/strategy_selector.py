@@ -294,12 +294,21 @@ class StrategySelector:
         """
         统计 query 中提到了几个产品
 
-        通过正则匹配常见的产品名模式:
-          - X保、Xe生、X尊享、X守护、X健康 等后缀
-        返回不同产品名的数量
-
+        优先使用 KG 实体链接器（更精准），回退到正则匹配。
         >=2 个说明用户在做对比或同时问多个产品，需要拆分
         """
+        # ── 尝试 KG 实体链接 ──
+        try:
+            from rag_qa.core.kg_entity_linker import KGEntityLinker
+            linker = KGEntityLinker()
+            entities = linker.link(query)
+            products = entities.get("products", [])
+            if products:
+                return len(products)
+        except Exception:
+            pass
+
+        # ── 回退: 正则匹配 ──
         patterns = [
             r"[\u4e00-\u9fa5]{2,6}(?:保|e生|尊享|守护|健康)",
         ]
@@ -309,34 +318,3 @@ class StrategySelector:
             products.update(matches)
         return len(products)
 
-    def _is_vague_query(self, query: str, entities: dict) -> bool:
-        """
-        判断 query 是否过于模糊
-
-        判定条件: query < 8 个字 且 没有提取到任何实体
-        模糊 query 适合用 HyDE 增强（先生成假设文档再检索）
-        """
-        return len(query.strip()) < 8 and not entities
-
-    def _extract_dimensions(self, query: str) -> list:
-        """
-        从 query 中提取查询维度（等待期/免赔额/保费/保障范围等）
-
-        用于子查询拆分策略，抽取用户在问的保险条款维度。
-        """
-        dim_patterns = [
-            r"(等待期|犹豫期|宽限期)",
-            r"(免赔额|起付线|自付比例)",
-            r"(保费|费率|多少钱)",
-            r"(保障范围|保险责任|保什么)",
-            r"(续保|续费|保证续保)",
-            r"(健康告知|核保|告知义务)",
-            r"(理赔|赔付|报销)",
-            r"(犹豫期|退保|现金价值)",
-        ]
-        dimensions = []
-        for pat in dim_patterns:
-            m = re.search(pat, query)
-            if m:
-                dimensions.append(m.group(1))
-        return dimensions

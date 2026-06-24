@@ -1,28 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI 网关 — API 层入口
+FastAPI 网关 — 双通道 API 层入口
 
-提供三个主要端点:
-  1. POST /chat         — 同步问答 (简单场景)
-  2. GET  /chat/stream   — SSE 流式问答 (推荐，用户体验好)
-  3. POST /admin/ingest  — 文档摄取 (管理后台调用)
+双通道架构:
+  - CUSTOMER 通道: 外部客户 → RAG Pipeline（轻量、快速、只看自己数据、严格合规）
+  - AGENT 通道:   内部人员 → Multi-Agent Orchestrator（完整编排、全量数据、宽松合规）
+
+提供四个端点:
+  1. POST /chat         — 同步问答（按角色自动分流）
+  2. GET  /chat/stream   — SSE 流式问答（按角色自动分流）
+  3. POST /admin/ingest  — 文档摄取（仅 ADMIN）
+  4. GET  /health        — 健康检查
 
 SSE (Server-Sent Events) 流式返回:
   用户提问后，服务端一边处理一边推送中间状态:
-    event: thinking  → "正在分析问题..."
-    event: searching → "正在检索条款..."
-    event: answer    → 逐字推送答案
-    event: done      → 完成，附带来源引用
-
-  好处: 用户不用干等 350ms+，立刻看到反馈
+    event: status   → 处理进度
+    event: answer   → 答案片段
+    event: sources  → 引用来源
+    event: done     → 完成信号
 """
 
 import json
 import asyncio
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, HTTPException, Request, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-from pydantic import BaseModel, Field
 from typing import Optional
 
 from base.logger import logger
@@ -35,15 +37,27 @@ from agent.sub_agents import (
 from agent.orchestrator import Orchestrator
 from agent.memory import get_memory_manager
 
+# ── 双通道模型与认证 ──
+from gateway.models import ChatRequest, ChatResponse, IngestRequest
+from gateway.auth import (
+    UserContext, UserRole, INTERNAL_ROLES, ADMIN_ROLES,
+    get_current_user,
+)
+
 
 # ============================================================
 # FastAPI 应用初始化
 # ============================================================
 
 app = FastAPI(
-    title="保险智能客服 API",
-    description="RAG 智能客服 + 纯多 Agent 协作 (Orchestrator + 4 领域 Agent)",
-    version="3.0.0",
+    title="保险智能客服 API — 双通道架构",
+    description=(
+        "RAG 智能客服 + 多 Agent 协作 (Orchestrator + 4 领域 Agent)\n\n"
+        "双通道模式:\n"
+        "  - Customer 通道: 外部客户自助问答 (RAG Pipeline)\n"
+        "  - Agent 通道:   内部人员 AI 助手 (Multi-Agent Orchestrator)"
+    ),
+    version="4.0.0",
 )
 
 # 跨域配置 (开发环境允许所有来源，生产环境应该限制)
@@ -58,7 +72,7 @@ app.add_middleware(
 # ── 初始化 RAG 系统 (单例) ──
 rag_system = RAGSystem()
 
-# ── 多 Agent 系统 (懒初始化，在首次使用或 startup 事件中初始化) ──
+# ── 多 Agent 系统 (懒初始化) ──
 _orchestrator = None  # type: Optional[Orchestrator]
 
 
@@ -103,7 +117,7 @@ def init_multi_agent():
         mm = get_memory_manager()
         checkpointer = mm.get_checkpointer()
 
-        # ── 创建四个子 Agent（注入 checkpointer）──
+        # ── 创建四个子 Agent ──
         agents = {
             "insurance": InsuranceAgent(
                 vector_store=vector_store,
@@ -155,90 +169,126 @@ def init_multi_agent():
 
 
 # ============================================================
-# 请求 / 响应模型
-# ============================================================
-
-
-class ChatRequest(BaseModel):
-    """聊天请求"""
-
-    query: str = Field(..., description="用户问题", min_length=1, max_length=2000)
-    session_id: str = Field(default="", description="会话 ID (多轮对话时传入)")
-
-
-class ChatResponse(BaseModel):
-    """聊天响应"""
-
-    answer: str = Field(description="回答内容")
-    intent: str = Field(default="", description="识别的意图")
-    strategy: str = Field(default="", description="使用的检索策略")
-    sources: list[dict] = Field(default_factory=list, description="引用的条款来源")
-    latency_ms: float = Field(default=0, description="处理耗时 (毫秒)")
-    cache_hit: bool = Field(default=False, description="是否命中缓存")
-
-
-class IngestRequest(BaseModel):
-    """文档摄取请求"""
-
-    pdf_paths: list[str] = Field(description="PDF 文件路径列表")
-    insurer: str = Field(description="保险公司名称")
-    product_name: str = Field(description="产品名称")
-    product_code: str = Field(description="产品编码")
-
-
-# ============================================================
-# 端点 1: 同步问答
+# 端点 1: 同步问答 — 双通道自动分流
 # ============================================================
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
-    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    user: UserContext = Depends(get_current_user),
 ):
     """
-    统一问答端点 — Orchestrator 多 Agent 协作（含长短记忆）
+    统一问答端点 — 按角色自动分流
 
-    Header:
-      X-User-Id: 用户 ID（Spring 网关认证后注入），用于查询长记忆
+    Customer 通道: RAG Pipeline（轻量快速，只看自己的数据）
+    Agent 通道:    Multi-Agent Orchestrator（完整编排，全量数据）
 
-    所有请求统一走 Orchestrator，内部自动路由。
+    Headers:
+      X-User-Id:   用户唯一标识（Spring Gateway 认证后注入）
+      X-User-Role: 角色: customer / agent / underwriter / admin
+      X-Org-Id:    所属机构（可选）
     """
-    user_id = x_user_id or ""
     logger.info(
-        f"收到请求: user_id={user_id[:8] if user_id else '?'} "
-        f"query='{request.query[:50]}'"
+        f"[{user.channel.upper()}] 收到请求: user={user.display_name} "
+        f"role={user.role.value} query='{request.query[:50]}'"
     )
 
+    if user.is_customer:
+        return await _customer_chat(request, user)
+    else:
+        return await _agent_chat(request, user)
+
+
+async def _customer_chat(request: ChatRequest, user: UserContext) -> ChatResponse:
+    """
+    Customer 通道 — RAG Pipeline
+
+    特点: 轻量快速（~200ms），只能查自己的保单，严格合规审查，
+          回答通俗易懂，附带免责声明。
+    """
+    try:
+        result = rag_system.query(
+            request.query,
+            session_id=request.session_id,
+            user_role=user.role.value,
+        )
+
+        return ChatResponse(
+            answer=result.answer,
+            intent=result.intent,
+            strategy=f"customer_{result.strategy}",
+            sources=result.sources,
+            latency_ms=result.latency_ms,
+            cache_hit=result.cache_hit,
+            channel="customer",
+            route_mode="rag",
+            agents_used=[],
+            disclaimer=(
+                "⚠️ 以上信息基于保险条款解读，不构成投保或理赔建议。"
+                "具体以保险合同约定和保险公司审核为准。"
+            ),
+        )
+
+    except Exception as e:
+        logger.error(f"[CUSTOMER] 处理失败: {e}", exc_info=True)
+        return ChatResponse(
+            answer="抱歉，系统暂时繁忙，请稍后再试或联系人工客服。",
+            strategy="error",
+            channel="customer",
+            route_mode="rag",
+            disclaimer="如有紧急问题，请拨打客服热线。",
+        )
+
+
+async def _agent_chat(request: ChatRequest, user: UserContext) -> ChatResponse:
+    """
+    Agent 通道 — Multi-Agent Orchestrator
+
+    特点: 完整编排（~500ms），可查任意客户数据，宽松合规，
+          返回完整数据（费率表、核保规则、对比表）。
+    """
     # ── 初始化多 Agent 系统 (懒加载) ──
     orch = init_multi_agent()
     if orch is None:
-        logger.warning("多 Agent 不可用，降级为纯 RAG")
+        logger.warning("[AGENT] 多 Agent 不可用，降级为纯 RAG")
         try:
-            result = rag_system.query(request.query, session_id=request.session_id)
+            result = rag_system.query(
+                request.query,
+                session_id=request.session_id,
+                user_role=user.role.value,
+            )
             return ChatResponse(
                 answer=result.answer,
                 intent=result.intent,
                 strategy="rag_fallback",
                 sources=result.sources,
                 latency_ms=result.latency_ms,
+                channel="agent",
+                route_mode="rag",
+                agents_used=[],
             )
         except Exception as e:
-            logger.error(f"RAG 降级失败: {e}")
+            logger.error(f"[AGENT] RAG 降级失败: {e}")
             return ChatResponse(
                 answer="抱歉，系统暂时繁忙，请稍后再试或联系人工客服。",
                 strategy="error",
+                channel="agent",
+                route_mode="rag",
             )
 
     try:
-        # ── 第 1 步: 构建 user_profile (长记忆) ──
+        # ── 第 1 步: 构建 user_profile (长记忆，内部人员可查任意客户) ──
         user_profile = {}
-        if user_id:
+        if user.user_id:
             try:
                 mm = get_memory_manager()
-                user_profile = mm.get_user_profile(user_id)
+                user_profile = mm.get_user_profile(
+                    user_id=user.user_id,
+                    role=user.role.value,
+                )
             except Exception as e:
-                logger.warning(f"获取用户画像失败: {e}，降级为空画像")
+                logger.warning(f"[AGENT] 获取用户画像失败: {e}，降级为空画像")
 
         # ── 第 2 步: 意图分类 ──
         intent = ""
@@ -250,71 +300,74 @@ async def chat(
             intent = intent_result.intent
             entities = intent_result.entities
         except Exception as e:
-            logger.warning(f"意图分类失败: {e}，使用默认路由")
+            logger.warning(f"[AGENT] 意图分类失败: {e}，使用默认路由")
 
-        # ── 第 3 步: Orchestrator 处理（注入长记忆 + session_id 用于短记忆）──
+        # ── 第 3 步: Orchestrator 处理 ──
         result = orch.process(
             query=request.query,
             intent=intent,
             entities=entities,
             session_id=request.session_id,
             user_profile=user_profile,
+            user_role=user.role.value,
         )
 
         return ChatResponse(
             answer=result["answer"],
             intent=intent,
-            strategy=f"orch_{result['route_mode']}",
+            strategy=f"agent_{result['route_mode']}",
             sources=result.get("sources", []),
             latency_ms=result["latency_ms"],
+            channel="agent",
+            route_mode=result["route_mode"],
+            agents_used=result.get("agents_used", []),
         )
 
     except Exception as e:
-        logger.error(f"处理请求失败: {e}", exc_info=True)
+        logger.error(f"[AGENT] 处理请求失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="服务器内部错误")
 
 
 # ============================================================
-# 端点 2: SSE 流式问答 (推荐)
+# 端点 2: SSE 流式问答 — 双通道自动分流
 # ============================================================
 
 
 @app.get("/chat/stream")
-async def chat_stream(query: str, session_id: str = ""):
+async def chat_stream(
+    query: str,
+    session_id: str = "",
+    user: UserContext = Depends(get_current_user),
+):
     """
-    SSE 流式问答端点
+    SSE 流式问答端点 — 按角色自动分流
 
-    使用 Server-Sent Events 逐步推送处理进度和答案:
-      event: status   → 处理进度 (正在分析/检索/生成...)
-      event: answer   → 答案片段 (逐字或逐句推送)
-      event: sources  → 引用的条款来源
-      event: done     → 处理完成
-      event: error    → 错误信息
+    Customer 通道: RAG Pipeline 流式输出 + 逐句推送 + 免责声明
+    Agent 通道:    RAG Pipeline 流式输出（内部使用，无冗余声明）
 
-    前端使用 EventSource 接收:
-      const es = new EventSource('/chat/stream?query=肺炎能赔吗');
-      es.addEventListener('answer', (e) => { appendText(e.data); });
-      es.addEventListener('done', (e) => { es.close(); });
+    Headers 同 POST /chat。
     """
 
     async def event_generator():
         try:
+            channel = user.channel
+
             # ── 推送状态: 开始处理 ──
             yield {
                 "event": "status",
                 "data": json.dumps(
-                    {"stage": "analyzing", "message": "正在分析问题..."},
+                    {"stage": "analyzing", "message": "正在分析问题...",
+                     "channel": channel},
                     ensure_ascii=False,
                 ),
             }
 
             # ── 执行 RAG 查询 ──
-            # 注意: RAG 是同步的，用 asyncio.to_thread 放到线程池执行
-            # 这样不会阻塞事件循环
             result = await asyncio.to_thread(
                 rag_system.query,
                 raw_query=query,
                 session_id=session_id,
+                user_role=user.role.value,
             )
 
             # ── 推送状态: 检索完成 ──
@@ -324,12 +377,13 @@ async def chat_stream(query: str, session_id: str = ""):
                     {
                         "stage": "searching",
                         "message": f"检索完成，找到 {len(result.sources)} 条相关条款",
+                        "channel": channel,
                     },
                     ensure_ascii=False,
                 ),
             }
 
-            # ── 推送答案 (逐句推送，模拟打字效果) ──
+            # ── 推送答案 (逐句推送) ──
             sentences = result.answer.split("。")
             for i, sentence in enumerate(sentences):
                 if sentence.strip():
@@ -338,8 +392,24 @@ async def chat_stream(query: str, session_id: str = ""):
                         "event": "answer",
                         "data": json.dumps({"text": text}, ensure_ascii=False),
                     }
-                    # 每句间隔 50ms，模拟打字效果
                     await asyncio.sleep(0.05)
+
+            # ── Customer 通道追加免责声明 ──
+            if user.is_customer:
+                disclaimer = (
+                    "⚠️ 以上信息基于保险条款解读，不构成投保或理赔建议。"
+                    "具体以保险合同约定和保险公司审核为准。"
+                )
+                for sentence in disclaimer.split("。"):
+                    if sentence.strip():
+                        yield {
+                            "event": "answer",
+                            "data": json.dumps(
+                                {"text": sentence.strip() + "。"},
+                                ensure_ascii=False,
+                            ),
+                        }
+                        await asyncio.sleep(0.03)
 
             # ── 推送来源引用 ──
             if result.sources:
@@ -357,13 +427,14 @@ async def chat_stream(query: str, session_id: str = ""):
                         "intent": result.intent,
                         "strategy": result.strategy,
                         "cache_hit": result.cache_hit,
+                        "channel": channel,
                     },
                     ensure_ascii=False,
                 ),
             }
 
         except Exception as e:
-            logger.error(f"流式处理失败: {e}", exc_info=True)
+            logger.error(f"[{user.channel.upper()}] 流式处理失败: {e}", exc_info=True)
             yield {
                 "event": "error",
                 "data": json.dumps(
@@ -375,21 +446,35 @@ async def chat_stream(query: str, session_id: str = ""):
 
 
 # ============================================================
-# 端点 3: 文档摄取 (管理后台)
+# 端点 3: 文档摄取 (管理后台，仅 ADMIN)
 # ============================================================
 
 
 @app.post("/admin/ingest")
-async def ingest_documents(request: IngestRequest):
+async def ingest_documents(
+    request: IngestRequest,
+    user: UserContext = Depends(get_current_user),
+):
     """
     文档摄取端点 — 新产品 PDF 上线
 
+    仅 ADMIN 角色可调用。
     管理后台调用此端点，将新产品的条款 PDF 导入知识库。
-    处理过程是同步的（可能需要几秒到几十秒），
     生产环境建议改为异步任务队列 (Celery / RQ)。
     """
+    if user.role not in ADMIN_ROLES:
+        logger.warning(
+            f"[SECURITY] 非 ADMIN 用户尝试调用 /admin/ingest: "
+            f"user={user.display_name} role={user.role.value}"
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"权限不足: 仅 ADMIN 可执行文档导入，当前角色: {user.role.value}",
+        )
+
     logger.info(
-        f"文档摄取请求: {request.product_name} ({len(request.pdf_paths)} 个文件)"
+        f"[ADMIN] 文档摄取请求: user={user.display_name} "
+        f"product={request.product_name} ({len(request.pdf_paths)} 个文件)"
     )
 
     try:
@@ -405,11 +490,14 @@ async def ingest_documents(request: IngestRequest):
         return {
             "status": "success",
             "stats": stats,
-            "message": f"摄取完成: 成功 {stats['success']} 个, 跳过 {stats['skipped']} 个, 失败 {stats['failed']} 个",
+            "message": (
+                f"摄取完成: 成功 {stats['success']} 个, "
+                f"跳过 {stats['skipped']} 个, 失败 {stats['failed']} 个"
+            ),
         }
 
     except Exception as e:
-        logger.error(f"文档摄取失败: {e}", exc_info=True)
+        logger.error(f"[ADMIN] 文档摄取失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"摄取失败: {e}")
 
 
@@ -423,8 +511,9 @@ async def health_check():
     """健康检查 — K8s 探针 / 负载均衡健康检查"""
     return {
         "status": "ok",
-        "service": "insurance-rag-agent",
-        "version": "1.0.0",
+        "service": "insurance-rag-agent-dual-channel",
+        "version": "4.0.0",
+        "channels": ["customer", "agent"],
     }
 
 
@@ -435,11 +524,11 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info("启动保险智能客服 API...")
+    logger.info("启动保险智能客服 API (双通道架构)...")
     uvicorn.run(
         "gateway.app:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,  # 开发模式：文件变更自动重启
+        reload=True,
         log_level="info",
     )
