@@ -61,10 +61,12 @@ class ComplianceGuard:
         # ── 监管敏感词 ──
         # 保险销售中不允许使用的承诺性/误导性表述
         self.REGULATORY_BLOCK_WORDS = [
-            "保证理赔", "一定能赔", "肯定赔",
+            "保证理赔", "一定能赔", "肯定可以赔", "肯定赔",
+            "100%能理赔",
             "绝对不会拒赔", "无条件赔付",
             "保本保息", "稳赚不赔",
             "最好的保险", "最便宜的",  # 极限用语
+            "保证承保", "一定承保", "肯定能买",  # 承保承诺
         ]
 
         # ── 竞品贬低模式 ──
@@ -127,12 +129,28 @@ class ComplianceGuard:
         if violated:
             modified = self._apply_fixes(response, violated, context_chunks)
 
-            # 内部人员: 单条轻微违规可修复放行
             # 外部客户: 零容忍，任何违规都拦截
             if user_role == "customer":
                 passed = False
             else:
-                passed = len(violated) <= 1
+                # 内部人员: 区分严重违规和轻微违规
+                # 严重违规（监管红线）: 即使只有1条也拦截
+                critical = [v for v in violated
+                           if v == "medical_advice"
+                           or v.startswith("regulatory_word:")]
+                # 轻微违规: 数量 ≤ 1 时可修复放行
+                minor = [v for v in violated
+                        if v not in critical]
+
+                if critical:
+                    passed = False
+                    logger.warning(
+                        f"合规检查: 严重违规 {critical} — 强制拦截"
+                    )
+                elif len(minor) <= 1:
+                    passed = True
+                else:
+                    passed = False
 
             return ComplianceResult(
                 passed=passed,

@@ -31,6 +31,7 @@ Orchestrator — 多 Agent 调度中心
 """
 
 import time
+import threading
 
 from agent.state import SubAgentTask
 from agent.sub_agents.base import SubAgentResult
@@ -110,7 +111,7 @@ INTENT_ROUTING = {
         "mode": "rag_fallback",
         "description": "投诉直接转人工，不走 Agent 推理",
     },
-    "闲聊": {
+    "闲聊寒暄": {
         "primary": "service",
         "secondary": None,
         "mode": "rag_fallback",
@@ -141,6 +142,8 @@ class Orchestrator:
         """
         self.agents = agents
         self.rag_system = rag_system
+        self._session_locks: dict[str, threading.Lock] = {}
+        self._session_locks_lock = threading.Lock()
         self._validate_agents()
 
     def _validate_agents(self):
@@ -237,7 +240,7 @@ class Orchestrator:
 
         # ── Step 6: 合规终审 ──
         t5 = time.time()
-        final = self._compliance_review(final, intent)
+        final = self._compliance_review(final, intent, user_role)
         pipeline["compliance"] = round((time.time() - t5) * 1000, 1)
 
         pipeline["total"] = round((time.time() - t0) * 1000, 1)
@@ -252,6 +255,7 @@ class Orchestrator:
 
         return {
             "answer": final,
+            "intent": intent,
             "route_mode": route["mode"],
             "agents_used": [t.agent_name for t in tasks],
             "sources": self._collect_sources(results),
@@ -282,9 +286,46 @@ class Orchestrator:
             # 简单 query 降级: 短问题且非复杂意图 → 直接 FAQ/RAG
             # 以下意图需要多步推理，即使 query 很短也不能降级
             complex_intents = {
-                "理赔咨询", "产品对比", "核保咨询", "投保流程",
+                "理赔咨询",
+                "产品对比",
+                "核保咨询",
+                "投保流程",
             }
-            if len(query) <= 8 and intent not in complex_intents:
+
+            # 保险核心关键词（短查询包含这些词时不降级）
+            _INSURANCE_CORE_WORDS = {
+                "投保",
+                "续保",
+                "退保",
+                "理赔",
+                "报案",
+                "核保",
+                "加保",
+                "保费",
+                "保额",
+                "免赔",
+                "等待期",
+                "犹豫期",
+                "条款",
+                "赔付",
+                "报销",
+                "住院",
+                "门诊",
+                "手术",
+                "意外",
+                "身故",
+                "重疾",
+                "医疗险",
+                "车险",
+                "寿险",
+            }
+
+            should_degrade = (
+                len(query) <= 4
+                and intent not in complex_intents
+                and not any(kw in query for kw in _INSURANCE_CORE_WORDS)
+            )
+            if should_degrade:
                 route["mode"] = "rag_fallback"
                 logger.info(
                     f"[Orchestrator] 简单 query '{query[:20]}' (intent={intent}) → RAG 降级"
@@ -323,7 +364,7 @@ class Orchestrator:
 
 注意:
 - 只输出 JSON，不要其他内容
-- 如果无法确定，用 "闲聊" 且 confidence=0.1
+- 如果无法确定，用 "闲聊寒暄" 且 confidence=0.1
 """
 
         try:
@@ -332,7 +373,7 @@ class Orchestrator:
                 temperature=0.0,
             )
 
-            intent = response.get("intent", "闲聊")
+            intent = response.get("intent", "闲聊寒暄")
             confidence = response.get("confidence", 0.5)
 
             # 低置信度 → 降级 FAQ
@@ -429,8 +470,7 @@ class Orchestrator:
         """
         为复杂意图获取知识图谱推理上下文
 
-        当意图是理赔咨询/产品对比/核保咨询时，用 KG 推理
-        补全产品-疾病-条款的关系链，帮助 Agent 做出更准确的判断。
+        委托 KGService 统一获取，消除与 rag_system._kg_reasoning_enhance() 的重复。
 
         Args:
             query: 用户 query
@@ -439,31 +479,11 @@ class Orchestrator:
         Returns:
             KG 推理上下文字符串，或空字符串
         """
-        # 仅对复杂意图启用 KG 推理
-        complex_intents = {"理赔咨询", "产品对比", "核保咨询", "条款解读"}
-        if intent not in complex_intents:
-            return ""
-
         try:
-            from rag_qa.core.kg_reasoner import KGReasoner
+            from rag_qa.core.kg.service import KGService
 
-            reasoner = KGReasoner()
-            paths = reasoner.reason_from_query(query)
-
-            if not paths:
-                return ""
-
-            parts = ["[知识图谱推理结果]"]
-            for i, path in enumerate(paths[:3]):
-                parts.append(f"  {path.explain()}")
-                for entity in path.entities_found[:3]:
-                    etype = entity.get("type", "")
-                    ename = entity.get("product_name") or entity.get("disease") or entity["name"]
-                    if etype == "Product":
-                        parts.append(f"    → 关联产品: {ename}")
-
-            return "\n".join(parts)
-
+            kg = KGService()
+            return kg.get_reasoning(query, intent)
         except Exception as e:
             logger.debug(f"[Orchestrator] KG 推理跳过: {e}")
             return ""
@@ -498,7 +518,9 @@ class Orchestrator:
     # 任务执行
     # ================================================================
 
-    def _execute_tasks(self, tasks: list[SubAgentTask], session_id: str, user_role: str = "agent") -> dict:
+    def _execute_tasks(
+        self, tasks: list[SubAgentTask], session_id: str, user_role: str = "agent"
+    ) -> dict:
         """
         按依赖顺序执行任务
 
@@ -510,6 +532,33 @@ class Orchestrator:
         Returns:
             dict: {task_id: SubAgentResult}
         """
+        # ── Session 级并发控制: 防止同一 session 的并发请求损坏检查点 ──
+        if session_id:
+            with self._session_locks_lock:
+                if session_id not in self._session_locks:
+                    self._session_locks[session_id] = threading.Lock()
+            session_lock = self._session_locks[session_id]
+        else:
+            session_lock = None
+
+        if session_lock:
+            acquired = session_lock.acquire(blocking=True, timeout=30)
+            if not acquired:
+                logger.error(f"[Orchestrator] Session {session_id} 锁获取超时")
+        else:
+            acquired = False
+        try:
+            results = self._execute_tasks_internal(tasks, session_id, user_role)
+        finally:
+            if session_lock and acquired:
+                session_lock.release()
+
+        return results
+
+    def _execute_tasks_internal(
+        self, tasks: list[SubAgentTask], session_id: str, user_role: str = "agent"
+    ) -> dict:
+        """任务执行的实际逻辑（由 _execute_tasks 加锁后调用）"""
         results = {}
         completed = set()
 
@@ -692,35 +741,58 @@ class Orchestrator:
     # 合规终审
     # ================================================================
 
-    def _compliance_review(self, answer: str, intent: str) -> str:
+    def _compliance_review(
+        self, answer: str, intent: str, user_role: str = "agent"
+    ) -> str:
         """
-        全局合规终审
+        全局合规终审 — 委托统一 ComplianceGuard（替换旧版弱字符串替换）
 
-        检查所有 Agent 的输出是否符合保险行业合规要求。
-        这是最后一道防线，任何子 Agent 的输出都会经过此处。
+        变化: 旧版仅对 7 个禁止短语做字符串替换。
+              新版使用 ComplianceGuard 的完整 5 规则检查:
+                1. 医疗建议检测
+                2. 监管敏感词（保证理赔、稳赚不赔等）
+                3. 贬低性表述
+                4. 金额引用验证
+                5. 角色感知严格度（customer 零容忍，agent/underwriter 宽限）
 
-        检查项:
-          1. 确定性承诺 (如 "一定能赔" → 替换为"以审核为准")
-          2. 医疗建议检测 (如 "建议你吃药" → 追加警告)
-          3. 缺失免责声明补偿
+        Args:
+            answer: 待审查的答案文本
+            intent: 意图类型
+            user_role: 用户角色
+
+        Returns:
+            审查后的安全文本
         """
-        replacements = [
-            ("一定能赔", "最终理赔结果以保险公司审核为准"),
-            ("肯定可以赔", "理赔资格需经保险公司正式审核"),
-            ("100%能理赔", "理赔结果以最终审核为准"),
-            ("保证承保", "承保结果以核保审核为准"),
-            ("一定承保", "核保结果以正式审核为准"),
-            ("肯定能买", "投保结果以核保审核为准"),
-        ]
+        try:
+            from rag_qa.core.compliance_guard import ComplianceGuard
 
-        for phrase, replacement in replacements:
-            if phrase in answer:
-                answer = answer.replace(phrase, replacement)
+            guard = ComplianceGuard()
+            result = guard.check(
+                response=answer,
+                context_chunks=None,
+                intent=intent,
+                user_role=user_role,
+            )
+
+            if not result.passed:
                 logger.warning(
-                    f"[Orchestrator] 合规: 替换禁止表述 '{phrase}' → '{replacement}'"
+                    f"[Orchestrator] 合规不通过: {result.violated_rules} — 返回安全兜底"
+                )
+                return (
+                    "很抱歉，您的问题我暂时无法直接回答。"
+                    "建议您通过官方渠道或联系人工客服获取更准确的信息。"
                 )
 
-        return answer
+            # 合规通过但有修改（如追加医疗免责声明）
+            if result.modified_response:
+                logger.info("[Orchestrator] 合规: 答案被修改（追加免责声明等）")
+                return result.modified_response
+
+            return answer
+
+        except Exception as e:
+            logger.warning(f"[Orchestrator] 合规审查异常，放行: {e}")
+            return answer
 
     # ================================================================
     # RAG 降级
@@ -756,9 +828,9 @@ class Orchestrator:
 
         if self.rag_system:
             try:
-                rag_result = self.rag_system.process_query(query)
-                answer = rag_result.get("answer", "抱歉，无法处理您的请求。")
-                sources = rag_result.get("sources", [])
+                rag_result = self.rag_system.query(query)
+                answer = rag_result.answer or "抱歉，无法处理您的请求。"
+                sources = rag_result.sources or []
             except Exception as e:
                 logger.error(f"[Orchestrator] RAG 降级失败: {e}")
                 answer = "抱歉，当前服务不可用。请联系人工客服。"

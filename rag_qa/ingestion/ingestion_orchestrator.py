@@ -82,13 +82,16 @@ class IngestionOrchestrator:
       - 错误隔离: 单个文档失败不影响其他文档
     """
 
-    def __init__(self, vector_store=None, mysql_session=None):
+    def __init__(self, vector_store=None, mysql_session=None, kg=None, query_cache=None):
         """
         Args:
             vector_store: VectorStore 实例（Milvus 写入）
             mysql_session: MySQL 会话（元数据写入）
+            kg: InsuranceKG 实例（Neo4j 知识图谱写入，可选）
+            query_cache: QueryResultCache 实例（文档更新后清空缓存，可选）
         """
         self.parser = PDFParser()
+        self.query_cache = query_cache
         from rag_qa.ingestion.bert_segmenter import get_segmenter
 
         self.chunker = DocumentChunker(
@@ -96,6 +99,7 @@ class IngestionOrchestrator:
         )
         self.vector_store = vector_store
         self.mysql = mysql_session
+        self.kg = kg
 
     def ingest(self, documents: list[ProductDocument]) -> dict:
         """
@@ -108,7 +112,8 @@ class IngestionOrchestrator:
             dict: 处理结果统计
                 {"total": 10, "success": 8, "skipped": 1, "failed": 1}
         """
-        stats = {"total": len(documents), "success": 0, "skipped": 0, "failed": 0}
+        stats = {"total": len(documents), "success": 0, "skipped": 0,
+                 "failed": 0, "kg_failed": 0}
 
         for doc in documents:
             try:
@@ -117,15 +122,31 @@ class IngestionOrchestrator:
                     stats["success"] += 1
                 elif result == "skipped":
                     stats["skipped"] += 1
+                elif result == "success_without_kg":
+                    stats["success"] += 1
+                    stats["kg_failed"] += 1
             except Exception as e:
                 # 单个文档失败不影响其他文档
                 logger.error(f"文档处理失败: {doc.file_name} - {e}", exc_info=True)
                 stats["failed"] += 1
 
+        if stats["kg_failed"] > 0:
+            logger.warning(
+                f"⚠️ KG 同步失败: {stats['kg_failed']} 个文档已入库但 KG 不完整。"
+                f"如需修复，请手动调用 kg.build_from_clauses() 重建。"
+            )
+
+        # ── 文档更新后清空查询结果缓存 ──
+        if stats["success"] > 0 and self.query_cache:
+            try:
+                self.query_cache.invalidate_all()
+            except Exception as e:
+                logger.warning(f"缓存失效失败（非致命）: {e}")
+
         logger.info(
             f"摄取完成: 总共 {stats['total']} 个, "
-            f"成功 {stats['success']}, 跳过 {stats['skipped']}, "
-            f"失败 {stats['failed']}"
+            f"成功 {stats['success']}(含KG未同步{stats['kg_failed']}), "
+            f"跳过 {stats['skipped']}, 失败 {stats['failed']}"
         )
         return stats
 
@@ -182,10 +203,15 @@ class IngestionOrchestrator:
             chunk.metadata["dense_vector"] = dense_all[i]
             chunk.metadata["sparse_vector"] = sparse_all[i]
 
-        # ── 步骤 7: 写入 Milvus ──
+        # ── 步骤 7: 写入 Milvus (仅子块) ──
+        # 父块文本已通过 parent_text 字段存储在子块中，
+        # 检索时通过 _enrich_with_parent() 获取父块上下文。
+        # 只存子块可减少约 60-70% 的 Milvus 存储和索引开销。
         if self.vector_store:
             milvus_entities = []
             for chunk in chunks:
+                if chunk.chunk_type != "child":
+                    continue
                 milvus_entities.append({
                     "chunk_id": chunk.chunk_id,
                     "text": chunk.text,
@@ -214,11 +240,37 @@ class IngestionOrchestrator:
                 doc.insurer, doc.product_code, doc.version
             )
 
-        logger.info(
-            f"✅ 文档摄取成功: {doc.product_name} ({doc.doc_type}) "
-            f"| {len(chunks)} chunks | doc_id={doc_id}"
-        )
-        return "success"
+        # ── 步骤 10: 同步 Neo4j 知识图谱 ──
+        # 将新产品条款关系写入 KG，确保 KG 推理能查到新产品。
+        # 只传子块（父块是子块合并，传父块会产生重复节点）。
+        kg_ok = True
+        if self.kg:
+            try:
+                child_chunks = [c for c in chunks if c.chunk_type == "child"]
+                kg_count = self.kg.build_from_clauses(child_chunks)
+                logger.info(
+                    f"[KG] 同步完成: {kg_count} 个操作, "
+                    f"{len(child_chunks)} 个 chunk | 产品={doc.product_name}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[KG] 同步失败 (不影响检索，可手动重跑 build_from_clauses): {e}",
+                    exc_info=True,
+                )
+                kg_ok = False
+
+        if kg_ok:
+            logger.info(
+                f"✅ 文档摄取成功: {doc.product_name} ({doc.doc_type}) "
+                f"| {len(chunks)} chunks | doc_id={doc_id}"
+            )
+            return "success"
+        else:
+            logger.info(
+                f"⚠️ 文档摄取成功(不含KG): {doc.product_name} ({doc.doc_type}) "
+                f"| {len(chunks)} chunks | doc_id={doc_id} | KG 同步失败需手动修复"
+            )
+            return "success_without_kg"
 
     # ============================================================
     # 内部方法
@@ -363,5 +415,17 @@ def ingest_local_pdfs(
             file_md5=md5,
         ))
 
-    orchestrator = IngestionOrchestrator(vector_store, mysql_session)
+    # 初始化 KG 实例（Neo4j，失败自动降级为 NetworkX）
+    kg = None
+    try:
+        from rag_qa.core.kg_store import get_kg
+        kg = get_kg()
+    except Exception as e:
+        logger.warning(f"[KG] 初始化跳过: {e}")
+
+    orchestrator = IngestionOrchestrator(
+        vector_store=vector_store,
+        mysql_session=mysql_session,
+        kg=kg,
+    )
     return orchestrator.ingest(documents)

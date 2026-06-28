@@ -572,7 +572,10 @@ class VectorStore:
         if not self._connected:
             self.connect()
 
-        expr = f'insurer == "{insurer}" and product_code == "{product_code}"'
+        expr = (
+            f'insurer == "{self._escape_filter_value(insurer)}" '
+            f'and product_code == "{self._escape_filter_value(product_code)}"'
+        )
         self.collection.delete(expr)
         self.collection.flush()
         logger.info(f"已删除: {insurer}/{product_code} 的所有 chunks")
@@ -583,33 +586,37 @@ class VectorStore:
 
         用法: 新版本 chunks 插入后，调用此方法把旧版本标记为 is_valid=False。
         这样检索时 filter='is_valid == true' 自动过滤掉旧版本。
+
+        Crash 安全: 采用「先插入失效副本→再删除旧记录」的顺序。
+        如果在 flush 之间 crash，新版本数据已安全写入，
+        下次 ingestion 时会恢复。
         """
         if not self._connected:
             self.connect()
 
         # 查找旧版本的 chunk IDs
         expr = (
-            f'insurer == "{insurer}" '
-            f'and product_code == "{product_code}" '
-            f'and version != "{version}"'
+            f'insurer == "{self._escape_filter_value(insurer)}" '
+            f'and product_code == "{self._escape_filter_value(product_code)}" '
+            f'and version != "{self._escape_filter_value(version)}"'
         )
         old_chunks = self.collection.query(expr, output_fields=["id"])
 
         if old_chunks:
             old_ids = [c["id"] for c in old_chunks]
-            # Milvus 不支持单字段 UPDATE，采用「删旧+重插」策略：
-            # 先查询旧 chunk 的完整实体，改 is_valid=False 后重新插入
+            # Crash 安全策略:
+            # 1. 先查旧 chunk 完整数据
             old_entities = self.collection.query(
                 expr, output_fields=["*"],
             )
             if old_entities:
-                # 标记失效
+                # 2. 标记失效 + 先插入失效副本（即使此时 crash，数据是完整的）
                 for e in old_entities:
                     e["is_valid"] = False
-                # 删除旧实体，然后重新插入失效版本
-                self.collection.delete(expr)
-                self.collection.flush()
                 self.collection.insert(old_entities)
+                self.collection.flush()
+                # 3. 再删除旧记录（此时 crash 不影响正确性——失效副本已安全）
+                self.collection.delete(expr)
                 self.collection.flush()
                 logger.info(
                     f"标记 {len(old_ids)} 条旧版本 chunks 失效: {insurer}/{product_code}"

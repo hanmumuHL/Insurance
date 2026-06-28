@@ -38,13 +38,26 @@ class QueryResultCache:
     def invalidate_intent(self, intent: str):
         """清空某意图的所有缓存（如文档更新后）"""
         pattern = f"result:{intent}:*"
+        self._delete_by_pattern(pattern)
+
+    def invalidate_all(self):
+        """清空所有查询结果缓存（文档更新时调用）"""
+        self._delete_by_pattern("result:*")
+        logger.info("QueryResultCache: 已清空全部缓存")
+
+    def _delete_by_pattern(self, pattern: str):
+        """按 pattern 扫描并删除 Redis 键"""
         try:
             cursor = 0
+            deleted = 0
             while True:
                 cursor, keys = self.redis.client.scan(cursor, match=pattern, count=100)
                 if keys:
                     self.redis.delete(*keys)
+                    deleted += len(keys)
                 if cursor == 0:
                     break
+            if deleted > 0:
+                logger.info(f"缓存清理: pattern={pattern} 已删除 {deleted} 个键")
         except Exception as e:
-            logger.warning(f"Query 缓存清理失败: {e}")
+            logger.warning(f"缓存清理失败 (pattern={pattern}): {e}")

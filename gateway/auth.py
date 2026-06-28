@@ -12,7 +12,7 @@
           在请求头中注入 X-User-Id、X-User-Role、X-Org-Id。
           本模块只做提取和校验，不做密码/Token 验证。
 
-开发环境: 不传 header 时默认为 agent 角色（向后兼容）。
+开发环境: auth_enabled=False 时不传 header 默认为 customer 角色（最小权限原则）。
 """
 
 from enum import Enum
@@ -78,7 +78,7 @@ class UserContext:
 
 async def get_current_user(
     x_user_id: str = Header("", alias="X-User-Id"),
-    x_user_role: str = Header(settings.auth.default_role, alias="X-User-Role"),
+    x_user_role: str = Header(None, alias="X-User-Role"),
     x_org_id: str = Header("", alias="X-Org-Id"),
     x_display_name: str = Header("", alias="X-Display-Name"),
 ) -> UserContext:
@@ -86,17 +86,34 @@ async def get_current_user(
     FastAPI Dependency — 从请求头提取用户信息
 
     生产环境中由上游 API Gateway 完成 SSO 后注入这些 header。
-    开发/测试环境中不传则默认 agent 角色（向后兼容）。
+    当 auth_enabled=True 且 X-User-Role 缺失时，返回 401。
+    当 auth_enabled=False 时，默认 customer 角色（最小权限原则）。
 
     Raises:
-        HTTPException 401: 外部客户未提供 X-User-Id
+        HTTPException 401: auth_enabled=True 时未提供 X-User-Role 或客户未提供 X-User-Id
         HTTPException 400: 非法的 X-User-Role 值
     """
     # ── 解析角色 ──
+    if not settings.auth.auth_enabled:
+        # 认证关闭时强制使用默认角色，忽略客户端传入的所有角色头
+        # 防止攻击者绕过上游网关直接注入 X-User-Role: admin
+        if x_user_role and x_user_role != settings.auth.default_role:
+            logger.warning(
+                f"[SECURITY] auth_enabled=False 但收到 X-User-Role={x_user_role}，"
+                f"强制使用默认角色 {settings.auth.default_role}"
+            )
+        x_user_role = settings.auth.default_role
+    elif not x_user_role:
+        # 认证开启时，角色头缺失 → 401
+        raise HTTPException(
+            status_code=401,
+            detail="缺少认证信息 (X-User-Role)，请通过 Gateway 访问",
+        )
+
     valid_roles = {r.value for r in UserRole}
     if x_user_role not in valid_roles:
-        logger.warning(f"非法的 X-User-Role: '{x_user_role}'，降级为 agent")
-        role = UserRole.AGENT
+        logger.warning(f"非法的 X-User-Role: '{x_user_role}'，降级为 {settings.auth.default_role}")
+        role = UserRole(settings.auth.default_role)
     else:
         role = UserRole(x_user_role)
 

@@ -23,10 +23,11 @@ LLM 客户端 — DeepSeek (主) + 千问 (降级) 双通道调用
 
 import time
 import json
+import threading
 from typing import Optional
 from dataclasses import dataclass, field
 
-from openai import OpenAI, APIError, APITimeoutError, RateLimitError, APIStatusError
+from openai import OpenAI, AsyncOpenAI, APIError, APITimeoutError, RateLimitError, APIStatusError
 from base.logger import logger
 from config.settings import settings
 
@@ -59,6 +60,30 @@ class LLMResponse:
 
 
 # ============================================================
+# 流式异常 — 用于通知调用方流式中断
+# ============================================================
+
+class LLMStreamError(Exception):
+    """
+    LLM 流式调用中途失败时抛出的异常
+
+    与普通 Exception 的区别:
+      partial_content 保存了失败前已经产出的 token 文本，
+      调用方可以决定是用已产出的内容结束流，还是丢弃。
+
+    使用场景:
+      - async for token in client.astream_chat(...):
+          ...
+      - 如果 DeepSeek 在生成一半时断连，抛出此异常
+      - Gateway 捕获后，可以用 partial_content 结束回答
+    """
+
+    def __init__(self, message: str, partial_content: str = ""):
+        super().__init__(message)
+        self.partial_content = partial_content
+
+
+# ============================================================
 # 熔断器 — 连续失败时自动切换
 # ============================================================
 
@@ -87,44 +112,56 @@ class CircuitBreaker:
         self.failure_count = 0           # 连续失败计数
         self.last_failure_time = 0.0     # 上次失败时间戳
         self.is_open = False             # 是否处于熔断状态
+        self._lock = threading.Lock()    # 线程安全锁
 
-    def should_skip(self) -> bool:
+    def should_skip(self, has_fallback: bool = True) -> bool:
         """
         判断是否应该跳过 (熔断中)
+
+        Args:
+            has_fallback: 是否有降级通道可用。若无降级通道，即使熔断也不跳过。
 
         Returns:
             True: 熔断中，应该跳过直接用降级通道
             False: 正常状态，可以尝试调用
         """
-        if not self.is_open:
-            return False
+        with self._lock:
+            if not self.is_open:
+                return False
 
-        # 检查冷却时间是否已过
-        elapsed = time.time() - self.last_failure_time
-        if elapsed >= self.cool_down_seconds:
-            # 冷却期已过，半开状态，允许试探性调用
-            logger.info(f"熔断器半开: 已冷却 {elapsed:.0f}s，试探性调用")
-            self.is_open = False
-            return False
+            # 无降级通道时不跳过——跳过就是硬失败
+            if not has_fallback:
+                logger.info("无降级通道可用，熔断器暂不拦截 primary")
+                return False
 
-        return True
+            # 检查冷却时间是否已过
+            elapsed = time.time() - self.last_failure_time
+            if elapsed >= self.cool_down_seconds:
+                # 冷却期已过，半开状态，允许试探性调用
+                logger.info(f"熔断器半开: 已冷却 {elapsed:.0f}s，试探性调用")
+                self.is_open = False
+                return False
+
+            return True
 
     def record_success(self):
         """记录成功 — 重置失败计数，关闭熔断"""
-        self.failure_count = 0
-        self.is_open = False
+        with self._lock:
+            self.failure_count = 0
+            self.is_open = False
 
     def record_failure(self):
         """记录失败 — 累计失败计数，达到阈值则熔断"""
-        self.failure_count += 1
-        self.last_failure_time = time.time()
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
 
-        if self.failure_count >= self.failure_threshold:
-            self.is_open = True
-            logger.warning(
-                f"熔断器触发: 连续失败 {self.failure_count} 次，"
-                f"冷却 {self.cool_down_seconds}s"
-            )
+            if self.failure_count >= self.failure_threshold:
+                self.is_open = True
+                logger.warning(
+                    f"熔断器触发: 连续失败 {self.failure_count} 次，"
+                    f"冷却 {self.cool_down_seconds}s"
+                )
 
 
 # ============================================================
@@ -190,6 +227,23 @@ class LLMClient:
         # ── 规划模型: DeepSeek-R1 ──
         self.planner_model = cfg.planner_model  # "deepseek-reasoner"
 
+        # ── 异步客户端 (用于流式 SSE) ──
+        self.async_primary = AsyncOpenAI(
+            api_key=cfg.deepseek_api_key,
+            base_url=cfg.deepseek_base_url,
+            timeout=30.0,
+            max_retries=0,
+        )
+
+        self.async_fallback = None
+        if cfg.qwen_api_key and cfg.qwen_api_key != "sk-your-qwen-key":
+            self.async_fallback = AsyncOpenAI(
+                api_key=cfg.qwen_api_key,
+                base_url=cfg.qwen_base_url,
+                timeout=30.0,
+                max_retries=0,
+            )
+
         # ── 熔断器 ──
         self.circuit_breaker = CircuitBreaker(
             failure_threshold=5,
@@ -230,7 +284,8 @@ class LLMClient:
         max_tokens = max_tokens if max_tokens is not None else cfg.max_tokens
 
         # ── 尝试主通道 (DeepSeek) ──
-        if not self.circuit_breaker.should_skip():
+        has_fallback = self.fallback_client is not None
+        if not self.circuit_breaker.should_skip(has_fallback=has_fallback):
             response = self._call_primary(
                 messages, temperature, max_tokens, model, json_mode
             )
@@ -461,12 +516,198 @@ class LLMClient:
             logger.error(f"千问降级也失败: {e}")
             return LLMResponse(error=f"Qwen error: {e}")
 
+    # ============================================================
+    # 异步流式方法: 用于 SSE token 级流式输出
+    # ============================================================
+
+    async def astream_chat(
+        self,
+        messages: list[dict],
+        temperature: float = None,
+        max_tokens: int = None,
+        model: str = None,
+    ):
+        """
+        异步流式调用 LLM — 逐 token yield，用于 SSE 实时推送
+
+        与 chat() 共享同一套主备切换 + 熔断逻辑：
+          1. 先尝试 DeepSeek 流式
+          2. 第一个 token 前失败 → 切换千问流式
+          3. 中途失败 → 抛出 LLMStreamError（含已产出文本）
+          4. 全部失败 → 抛出 LLMStreamError
+
+        Args:
+            messages:    OpenAI 格式的消息列表
+            temperature: 温度参数（None 则用默认值）
+            max_tokens:  最大输出 token 数（None 则用默认值）
+            model:       指定模型名（None 则用 primary_model）
+
+        Yields:
+            str: 每个 token 片段（delta.content）
+
+        Raises:
+            LLMStreamError: 所有通道不可用，或流式中途断连
+        """
+        cfg = settings.llm
+        temperature = temperature if temperature is not None else cfg.temperature
+        max_tokens = max_tokens if max_tokens is not None else cfg.max_tokens
+
+        has_fallback = self.async_fallback is not None
+
+        # ── 尝试主通道流式 ──
+        if not self.circuit_breaker.should_skip(has_fallback=has_fallback):
+            try:
+                async for token in self._astream_primary(
+                    messages, temperature, max_tokens, model
+                ):
+                    yield token
+                self.circuit_breaker.record_success()
+                return
+            except LLMStreamError as e:
+                self.circuit_breaker.record_failure()
+                if e.partial_content:
+                    # 已产出部分内容 → 无法恢复，向上抛出
+                    raise
+                # 第一个 token 之前就失败了 → 继续走降级
+
+        # ── 降级到千问流式 ──
+        if self.async_fallback:
+            try:
+                async for token in self._astream_fallback(
+                    messages, temperature, max_tokens
+                ):
+                    yield token
+                return
+            except LLMStreamError as e:
+                if e.partial_content:
+                    raise
+                # 继续走重试
+
+        # ── 重试一次主通道 ──
+        if self.circuit_breaker.failure_count < self.circuit_breaker.failure_threshold:
+            logger.info("流式重试主通道...")
+            try:
+                async for token in self._astream_primary(
+                    messages, temperature, max_tokens, model
+                ):
+                    yield token
+                self.circuit_breaker.record_success()
+                return
+            except LLMStreamError as e:
+                if e.partial_content:
+                    raise
+
+        # ── 全部失败 ──
+        logger.error("LLM 流式主备通道全部失败")
+        raise LLMStreamError("所有 LLM 通道均不可用", partial_content="")
+
+    async def _astream_primary(
+        self,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+        model: str = None,
+    ):
+        """
+        流式调用主通道 (DeepSeek)
+
+        Yields:
+            str: token 文本片段
+
+        Raises:
+            LLMStreamError: 调用失败（含已产出文本）
+        """
+        use_model = model or self.primary_model
+        content_so_far = ""
+
+        try:
+            kwargs = {
+                "model": use_model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": True,
+            }
+
+            stream = await self.async_primary.chat.completions.create(**kwargs)
+
+            async for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    content_so_far += delta.content
+                    yield delta.content
+
+            logger.info(
+                f"DeepSeek 流式完成: model={use_model}, "
+                f"tokens≈{len(content_so_far)} chars"
+            )
+
+        except APIError as e:
+            logger.warning(f"DeepSeek 流式 API 错误: {e}")
+            raise LLMStreamError(
+                f"DeepSeek stream error: {e}",
+                partial_content=content_so_far,
+            )
+        except Exception as e:
+            logger.warning(f"DeepSeek 流式异常: {e}")
+            raise LLMStreamError(
+                f"DeepSeek stream error: {e}",
+                partial_content=content_so_far,
+            )
+
+    async def _astream_fallback(
+        self,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+    ):
+        """
+        流式调用降级通道 (千问)
+
+        Yields:
+            str: token 文本片段
+
+        Raises:
+            LLMStreamError: 调用失败（含已产出文本）
+        """
+        content_so_far = ""
+
+        try:
+            kwargs = {
+                "model": self.fallback_model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": True,
+            }
+
+            stream = await self.async_fallback.chat.completions.create(**kwargs)
+
+            async for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    content_so_far += delta.content
+                    yield delta.content
+
+            logger.info(
+                f"千问流式完成: model={self.fallback_model}, "
+                f"tokens≈{len(content_so_far)} chars"
+            )
+
+        except Exception as e:
+            logger.warning(f"千问流式异常: {e}")
+            raise LLMStreamError(
+                f"Qwen stream error: {e}",
+                partial_content=content_so_far,
+            )
+
 
 # ============================================================
 # 单例 — 整个应用共享一个 LLM 客户端
 # ============================================================
 
 _llm_client: Optional[LLMClient] = None
+_llm_lock = threading.Lock()
 
 
 def get_llm_client() -> LLMClient:
@@ -478,5 +719,7 @@ def get_llm_client() -> LLMClient:
     """
     global _llm_client
     if _llm_client is None:
-        _llm_client = LLMClient()
+        with _llm_lock:
+            if _llm_client is None:
+                _llm_client = LLMClient()
     return _llm_client

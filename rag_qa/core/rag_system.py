@@ -131,6 +131,9 @@ class RAGSystem:
         # ── LLM 客户端 (延迟初始化) ──
         self._llm_client = None
 
+        # ── 智能管道 (延迟初始化) ──
+        self._pipeline = None
+
         logger.info("RAG 系统初始化完成")
 
     # ============================================================
@@ -139,15 +142,31 @@ class RAGSystem:
 
     def query(self, raw_query: str, session_id: str = "", user_role: str = "agent") -> RAGResponse:
         """
-        处理一次用户查询 — 完整 pipeline（角色感知）
+        处理一次用户查询 — 委托 SmartPipeline 按需路由
 
         Args:
-            raw_query: 用户原始输入（未脱敏）
-            session_id: 会话 ID（用于上下文关联）
+            raw_query: 用户原始输入
+            session_id: 会话 ID
             user_role: 用户角色 (customer / agent / underwriter / admin)
 
         Returns:
             RAGResponse: 包含答案和中间过程信息的完整响应
+        """
+        # ── 懒初始化 SmartPipeline ──
+        if self._pipeline is None:
+            from rag_qa.core.pipeline.smart_pipeline import SmartPipeline
+            self._pipeline = SmartPipeline(rag_system=self)
+
+        return self._pipeline.run(raw_query, session_id=session_id, user_role=user_role)
+
+    def _query_legacy(self, raw_query: str, session_id: str = "", user_role: str = "agent") -> RAGResponse:
+        """
+        原始 12 步 pipeline（保留用于 A/B 测试和回退）
+
+        此方法是重构前的完整实现，保留以确保:
+          1. A/B 测试: 可与 SmartPipeline 对比性能/质量
+          2. 快速回退: SmartPipeline 出现问题时一键切回
+          3. 代码参考: 各 Stage 实现的原始逻辑出处
         """
         start_time = time.time()
         pipeline = {}  # 记录各阶段耗时

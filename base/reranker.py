@@ -71,6 +71,10 @@ class Reranker:
         if self._loaded:
             return
 
+        with _load_lock:
+            if self._loaded:
+                return
+
         logger.info(f"加载 Reranker 模型: {self.model_path} ...")
 
         try:
@@ -119,6 +123,7 @@ class Reranker:
         query: str,
         chunks: list,
         top_k: int = 5,
+        inplace: bool = False,
     ) -> list:
         """
         对候选 chunks 精排，返回 Top-K
@@ -128,15 +133,14 @@ class Reranker:
           - 普通 dict 列表 (有 "text" 和 "score" key)
           - 纯字符串列表
 
-        精排后的 chunk 会更新 score 字段为 Reranker 分数 (0-1)。
-
         Args:
             query: 用户查询文本
             chunks: 候选 chunk 列表
             top_k: 返回 Top-K
+            inplace: 是否原地修改传入对象的 score（默认 False，创建副本）
 
         Returns:
-            精排后的 Top-K chunks (原对象被原地修改 score)
+            精排后的 Top-K chunks（默认不修改原对象）
 
         精排原理 (Cross-Encoder):
           不同于向量检索用的 Bi-Encoder（query 和 chunk 分别编码再算余弦），
@@ -194,7 +198,16 @@ class Reranker:
             scores = scores.tolist()
 
         # ── 更新分数并排序 ──
-        for i, chunk in enumerate(chunks):
+        # 默认不修改调用方对象，创建带新分数的副本
+        import copy as _copy
+        if not inplace and hasattr(chunks[0], "score") if chunks else False:
+            scored_chunks = [_copy.copy(c) for c in chunks]
+        elif not inplace and isinstance(chunks[0], dict) if chunks else False:
+            scored_chunks = [dict(c) for c in chunks]
+        else:
+            scored_chunks = chunks
+
+        for i, chunk in enumerate(scored_chunks):
             if i < len(scores):
                 if hasattr(chunk, "score"):
                     chunk.score = float(scores[i])
@@ -202,7 +215,7 @@ class Reranker:
                     chunk["rerank_score"] = float(scores[i])
 
         # 按分数降序排列 (分数越高越相关)
-        scored = list(zip(scores, chunks))
+        scored = list(zip(scores, scored_chunks))
         scored.sort(key=lambda x: x[0], reverse=True)
 
         # 取 Top-K
@@ -264,13 +277,19 @@ class Reranker:
 # 单例
 # ============================================================
 
+import threading as _threading
+
 _reranker: Optional[Reranker] = None
+_load_lock = _threading.Lock()
+_reranker_lock = _threading.Lock()
 
 
 def get_reranker() -> Reranker:
     """获取 Reranker 单例"""
     global _reranker
     if _reranker is None:
-        _reranker = Reranker()
-        _reranker.load()
+        with _reranker_lock:
+            if _reranker is None:
+                _reranker = Reranker()
+                _reranker.load()
     return _reranker

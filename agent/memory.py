@@ -33,10 +33,14 @@ class MemoryManager:
     """
 
     SESSION_TTL = 1800  # 30 分钟
+    RETRY_BASE_DELAY = 60   # 首次重试等待秒数
+    RETRY_MAX_DELAY = 300   # 最大重试等待秒数
 
     def __init__(self):
         self._checkpointer = None
-        self._checkpointer_error = None
+        self._checkpointer_error = None      # 首次失败的错误信息
+        self._checkpointer_error_time = 0.0  # 上次失败的时间戳
+        self._retry_delay = self.RETRY_BASE_DELAY  # 当前重试等待秒数（指数退避）
 
     # ================================================================
     # 短记忆: LangGraph RedisSaver
@@ -44,38 +48,64 @@ class MemoryManager:
 
     def get_checkpointer(self):
         """
-        获取 RedisSaver 实例（单例，延迟初始化）
+        获取 RedisSaver 实例（单例，延迟初始化，失败后自动重试）
 
         Returns:
             RedisSaver 实例，或 None（降级为无状态模式）
+
+        重试策略:
+          - 首次失败后等待 RETRY_BASE_DELAY(60s) 再重试
+          - 连续失败时指数退避: 60s → 120s → 240s，上限 300s
+          - 成功后重置重试延迟
         """
         if self._checkpointer is not None:
             return self._checkpointer
 
+        # 检查是否需要重试
         if self._checkpointer_error is not None:
-            return None
+            elapsed = time.time() - self._checkpointer_error_time
+            if elapsed < self._retry_delay:
+                return None
+            # 冷却期已过，尝试重新连接
+            logger.info(
+                f"RedisSaver 重试: 距上次失败 {elapsed:.0f}s, "
+                f"当前重试延迟 {self._retry_delay}s"
+            )
 
         try:
             from langgraph.checkpoint.redis import RedisSaver
 
             cfg = settings.redis
+            # URL 编码密码中的特殊字符
+            from urllib.parse import quote
             redis_url = (
                 f"redis://{cfg.host}:{cfg.port}/{cfg.db}"
                 if not cfg.password
-                else f"redis://:{cfg.password}@{cfg.host}:{cfg.port}/{cfg.db}"
+                else f"redis://:{quote(cfg.password, safe='')}@{cfg.host}:{cfg.port}/{cfg.db}"
             )
 
             self._checkpointer = RedisSaver.from_conn_string(redis_url)
+            # 成功后重置错误状态和退避延迟
+            self._checkpointer_error = None
+            self._checkpointer_error_time = 0.0
+            self._retry_delay = self.RETRY_BASE_DELAY
             logger.info("RedisSaver checkpointer 初始化成功")
             return self._checkpointer
 
         except ImportError:
             self._checkpointer_error = "langgraph-checkpoint-redis 未安装"
+            self._checkpointer_error_time = time.time()
             logger.warning(self._checkpointer_error + "，降级为无状态模式")
             return None
         except Exception as e:
             self._checkpointer_error = str(e)
-            logger.error(f"RedisSaver 初始化失败: {e}，降级为无状态模式")
+            self._checkpointer_error_time = time.time()
+            logger.error(
+                f"RedisSaver 初始化失败: {e}，降级为无状态模式 "
+                f"(下次重试: {self._retry_delay}s 后)"
+            )
+            # 指数退避
+            self._retry_delay = min(self._retry_delay * 2, self.RETRY_MAX_DELAY)
             return None
 
     def build_config(self, session_id: str) -> dict:

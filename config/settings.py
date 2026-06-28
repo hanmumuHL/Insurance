@@ -4,6 +4,7 @@
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # 加载 .env
@@ -44,7 +45,7 @@ class MilvusConfig:
     uri: str = ""
 
     def __post_init__(self):
-        self.uri = f"http://{self.host}:{self.port}"
+        self.uri = f"{self.host}:{self.port}"
 
 
 @dataclass
@@ -58,7 +59,10 @@ class MySQLConfig:
 
     @property
     def url(self) -> str:
-        return f"mysql+mysqlconnector://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+        return (
+            f"mysql+mysqlconnector://{self.user}:{quote_plus(self.password)}"
+            f"@{self.host}:{self.port}/{self.database}"
+        )
 
 
 @dataclass
@@ -70,7 +74,7 @@ class RedisConfig:
 
     @property
     def url(self) -> str:
-        auth = f":{self.password}@" if self.password else ""
+        auth = f":{quote_plus(self.password)}@" if self.password else ""
         return f"redis://{auth}{self.host}:{self.port}/{self.db}"
 
 
@@ -95,7 +99,7 @@ class AuthConfig:
     """双通道认证配置"""
     auth_enabled: bool = field(default_factory=lambda: _env_bool("AUTH_ENABLED", True))
     jwt_secret: str = field(default_factory=lambda: _env("JWT_SECRET", ""))
-    default_role: str = "agent"  # 未认证时的默认角色（向后兼容）
+    default_role: str = "customer"  # 未认证时默认最低权限角色（最小权限原则）
 
 
 @dataclass

@@ -2,6 +2,7 @@
 Redis 客户端封装 — 底层连接 + 基本读写
 """
 import json
+import threading
 import redis
 from base.logger import logger
 from config.settings import settings
@@ -9,11 +10,20 @@ from config.settings import settings
 
 class RedisClient:
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._init()
+            with cls._lock:
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    try:
+                        instance._init()
+                        cls._instance = instance
+                    except Exception:
+                        # 初始化失败，重置以便后续调用重试
+                        cls._instance = None
+                        raise
         return cls._instance
 
     def _init(self):
@@ -54,6 +64,24 @@ class RedisClient:
 
     def setex(self, key: str, ttl: int, value: str):
         self.set(key, value, ttl)
+
+    def set_nx(self, key: str, value: str, ttl: int) -> bool:
+        """
+        SET NX EX — 分布式互斥锁原语
+
+        仅在 key 不存在时设置，同时设置过期时间。
+        用于缓存击穿防护（CacheGuard.get_with_lock）。
+
+        Returns:
+            True 表示获取锁成功（key 之前不存在）
+            False 表示锁已被其他进程持有
+        """
+        try:
+            acquired = self.client.set(key, value, nx=True, ex=ttl)
+            return bool(acquired)
+        except redis.RedisError as e:
+            logger.error(f"Redis SET NX 失败 {key}: {e}")
+            return False
 
     def delete(self, *keys):
         try:

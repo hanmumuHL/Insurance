@@ -425,6 +425,20 @@ class SubAgent(ABC):
             if tc.status in ("done", "running"):
                 continue
 
+            # ── 依赖失败检查: 上游失败 → 当前工具标记为 skipped ──
+            deps_failed = any(
+                tool_calls[dep_idx].status == "failed"
+                for dep_idx in tc.depends_on
+                if dep_idx < len(tool_calls)
+            )
+            if deps_failed:
+                tc.status = "skipped"
+                tc.result = "上游工具执行失败，本工具跳过"
+                tc.error_type = "permanent"
+                results.append({"tool": tc.tool_name, "status": "skipped", "result": tc.result})
+                logger.warning(f"[{self.name}] 工具 {tc.tool_name} 跳过: 依赖工具失败")
+                continue
+
             deps_ok = all(
                 tool_calls[dep_idx].status == "done"
                 for dep_idx in tc.depends_on
@@ -441,6 +455,7 @@ class SubAgent(ABC):
                 logger.error(f"[{self.name}] 工具不存在: {tc.tool_name}")
                 tc.status = "failed"
                 tc.result = f"工具 {tc.tool_name} 不存在"
+                tc.error_type = "permanent"  # 配置错误，重试无意义
                 results.append({"tool": tc.tool_name, "status": "failed", "result": tc.result})
                 continue
 
@@ -453,8 +468,18 @@ class SubAgent(ABC):
             except Exception as e:
                 tc.status = "failed"
                 tc.result = f"工具执行失败: {e}"
-                results.append({"tool": tc.tool_name, "status": "failed", "result": tc.result})
-                logger.error(f"[{self.name}] 工具 {tc.tool_name} 执行失败: {e}")
+                # 区分可恢复/不可恢复错误
+                error_str = str(e).lower()
+                if any(kw in error_str for kw in ("timeout", "connection", "timed out",
+                                                    "too many requests", "rate limit",
+                                                    "service unavailable", "try again")):
+                    tc.error_type = "transient"
+                else:
+                    tc.error_type = "permanent"
+                results.append({"tool": tc.tool_name, "status": "failed",
+                                "result": tc.result, "error_type": tc.error_type})
+                logger.error(f"[{self.name}] 工具 {tc.tool_name} 执行失败 "
+                             f"({tc.error_type}): {e}")
 
         return {"plan": plan, "tool_results": results}
 
@@ -473,21 +498,36 @@ class SubAgent(ABC):
         iteration = state.get("iteration", 0)
         max_iter = state.get("max_iterations", 3)
 
+        # 排除已跳过的工具（依赖失败导致），只检查实际需要执行的工具
+        active_tools = [tc for tc in (plan.tool_calls if plan else [])
+                       if tc.status != "skipped"]
         all_done = all(
             tc.status in ("done", "failed")
-            for tc in (plan.tool_calls if plan else [])
+            for tc in active_tools
         )
 
         if not all_done and iteration < max_iter:
             logger.info(f"[{self.name}] 部分工具未完成，返回 Planner (iteration={iteration + 1})")
             return {"iteration": iteration + 1}
 
-        failed = [tc for tc in (plan.tool_calls if plan else []) if tc.status == "failed"]
+        failed = [tc for tc in active_tools if tc.status == "failed"]
         if failed and iteration < max_iter:
-            logger.warning(f"[{self.name}] {len(failed)} 个工具失败，尝试重试")
-            for tc in failed:
-                tc.status = "pending"
-            return {"iteration": iteration + 1}
+            # 区分可恢复 vs 不可恢复错误
+            retryable = [tc for tc in failed if tc.error_type != "permanent"]
+            permanent = [tc for tc in failed if tc.error_type == "permanent"]
+            if permanent:
+                logger.warning(
+                    f"[{self.name}] {len(permanent)} 个工具不可恢复失败，不再重试: "
+                    f"{[tc.tool_name for tc in permanent]}"
+                )
+            if retryable:
+                logger.warning(
+                    f"[{self.name}] {len(retryable)} 个工具可恢复失败，"
+                    f"尝试重试 (iteration={iteration + 1})"
+                )
+                for tc in retryable:
+                    tc.status = "pending"
+                return {"iteration": iteration + 1}
 
         logger.info(f"[{self.name}] 所有工具执行完毕，进入 Synthesize")
         return {"iteration": iteration}
@@ -599,7 +639,7 @@ class SubAgent(ABC):
             return "synthesize"
 
         all_done = all(
-            tc.status in ("done", "failed")
+            tc.status in ("done", "failed", "skipped")
             for tc in (plan.tool_calls if plan else [])
         )
         if all_done:

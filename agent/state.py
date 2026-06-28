@@ -46,8 +46,9 @@ class ToolCall:
     tool_name: str
     tool_args: dict = field(default_factory=dict)
     depends_on: list[int] = field(default_factory=list)
-    status: str = "pending"
+    status: str = "pending"  # pending / running / done / failed / skipped
     result: Optional[str] = None
+    error_type: str = ""  # "" / "transient" / "permanent" — 用于区分可恢复/不可恢复错误
 
 
 @dataclass

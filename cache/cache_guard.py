@@ -31,14 +31,17 @@ class CacheGuard:
     # ── 防击穿：互斥锁 ──
     def get_with_lock(self, key: str, db_func, lock_ttl: int = 10, data_ttl: int = 3600):
         """
-        同一时刻只有一个请求去查 DB，其他请求等待后重试读缓存（最多3次递增等待）
+        同一时刻只有一个请求去查 DB，其他请求等待后重试读缓存。
+
+        等待策略: 总等待时间 = lock_ttl * 0.8，分 10 次等间隔轮询。
+        若 lock_ttl=10s，每 800ms 检查一次，最多等 8 秒。
         """
         cached = self.redis.get_json(key)
         if cached is not None:
             return cached
 
         lock_key = f"lock:{key}"
-        acquired = self.redis.client.set(lock_key, "1", nx=True, ex=lock_ttl)
+        acquired = self.redis.set_nx(lock_key, "1", ttl=lock_ttl)
 
         if acquired:
             try:
@@ -48,9 +51,11 @@ class CacheGuard:
             finally:
                 self.redis.delete(lock_key)
         else:
-            # 没拿到锁，递增等待后重试读缓存（最多3次）
-            for attempt in range(3):
-                time.sleep(0.05 * (attempt + 1))
+            # 基于锁 TTL 的动态等待（而非固定 300ms）
+            total_wait = lock_ttl * 0.8
+            interval = total_wait / 10.0
+            for attempt in range(10):
+                time.sleep(interval)
                 cached = self.redis.get_json(key)
                 if cached is not None:
                     return cached
