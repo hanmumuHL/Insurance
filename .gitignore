@@ -14,11 +14,15 @@ env/
 # 配置 (不要提交密钥)
 config/.env
 opencode.json
+lspconfig.json
+.codegraph
 
 # 内部设计文档
 AGENT_MERMAID.md
 INSURANCE_RAG_ARCHITECTURE.md
 RAG_MERMAID.md
+INTERVIEW_GUIDE.md
+PROJECT_FLOWCHART.md
 
 # 日志
 logs/*.log

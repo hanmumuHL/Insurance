@@ -70,32 +70,37 @@ class BGEM3Encoder:
         if self._loaded:
             return
 
-        logger.info(f"加载 BGE-M3 模型: {self.model_path} ...")
+        with _load_lock:
+            # 双重检查：可能另一个线程已完成加载
+            if self._loaded:
+                return
 
-        try:
-            # 方法 1: FlagEmbedding (BAAI 官方，推荐)
-            # Dense 编码: BGEM3FlagModel
-            # Sparse 编码: 自动输出词汇权重
-            from FlagEmbedding import BGEM3FlagModel
+            logger.info(f"加载 BGE-M3 模型: {self.model_path} ...")
 
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            try:
+                # 方法 1: FlagEmbedding (BAAI 官方，推荐)
+                # Dense 编码: BGEM3FlagModel
+                # Sparse 编码: 自动输出词汇权重
+                from FlagEmbedding import BGEM3FlagModel
 
-            self._model = BGEM3FlagModel(
-                self.model_path,
-                use_fp16=self.use_fp16 and device == "cuda",
-                device=device,
-            )
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
 
-            self._loaded = True
-            self._is_flag = True  # 标记为 FlagEmbedding 模式（支持 Sparse）
-            logger.info(f"BGE-M3 加载完成 (device={device})")
+                self._model = BGEM3FlagModel(
+                    self.model_path,
+                    use_fp16=self.use_fp16 and device == "cuda",
+                    device=device,
+                )
 
-        except ImportError:
-            # 方法 2: sentence-transformers (备选)
-            # 只输出 Dense 向量，不支持 Sparse
-            logger.warning("FlagEmbedding 未安装，降级为 sentence-transformers")
-            self._load_fallback()
+                self._loaded = True
+                self._is_flag = True  # 标记为 FlagEmbedding 模式（支持 Sparse）
+                logger.info(f"BGE-M3 加载完成 (device={device})")
+
+            except ImportError:
+                # 方法 2: sentence-transformers (备选)
+                # 只输出 Dense 向量，不支持 Sparse
+                logger.warning("FlagEmbedding 未安装，降级为 sentence-transformers")
+                self._load_fallback()
 
     def _load_fallback(self):
         """
@@ -263,7 +268,11 @@ class BGEM3Encoder:
 # 单例 — 整个应用共享一个编码器
 # ============================================================
 
+import threading as _threading
+
 _encoder: Optional[BGEM3Encoder] = None
+_load_lock = _threading.Lock()
+_encoder_lock = _threading.Lock()
 
 
 def get_encoder() -> BGEM3Encoder:
@@ -275,6 +284,8 @@ def get_encoder() -> BGEM3Encoder:
     """
     global _encoder
     if _encoder is None:
-        _encoder = BGEM3Encoder()
-        _encoder.load()
+        with _encoder_lock:
+            if _encoder is None:
+                _encoder = BGEM3Encoder()
+                _encoder.load()
     return _encoder

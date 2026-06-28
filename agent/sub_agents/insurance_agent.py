@@ -14,7 +14,7 @@
 """
 
 from agent.sub_agents.base import SubAgent
-from agent.tools.all_tools import get_tools_by_domain
+from agent.tools import get_tools_by_domain
 
 
 class InsuranceAgent(SubAgent):

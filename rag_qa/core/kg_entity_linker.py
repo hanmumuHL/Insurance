@@ -15,6 +15,7 @@ KG 实体链接器 — 将用户 query 中的实体链接到知识图谱 (Neo4j 
 """
 
 import re
+import threading
 from typing import Optional
 
 from base.logger import logger
@@ -22,6 +23,24 @@ from rag_qa.core.kg_store import (
     InsuranceKG, NodeType, EdgeType,
     DISEASE_TO_CATEGORY, INSURER_ALIAS,
 )
+
+
+# ============================================================
+# 单例
+# ============================================================
+
+_entity_linker: Optional["KGEntityLinker"] = None
+_linker_lock = threading.Lock()
+
+
+def get_entity_linker() -> "KGEntityLinker":
+    """获取 KGEntityLinker 单例（线程安全）"""
+    global _entity_linker
+    if _entity_linker is None:
+        with _linker_lock:
+            if _entity_linker is None:
+                _entity_linker = KGEntityLinker()
+    return _entity_linker
 
 
 class KGEntityLinker:

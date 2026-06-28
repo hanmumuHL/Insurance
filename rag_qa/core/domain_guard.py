@@ -57,11 +57,35 @@ class DomainBoundaryGuard:
         - agent/underwriter/admin: 内部人员可问系统级/操作类问题，全部放行
         - customer: 外部客户走完整检查
         """
-        # ── 内部人员: 不限制领域 ──
-        if user_role in ("agent", "underwriter", "admin"):
-            return GuardResult(passed=True, reason="internal")
-
         query_lower = query.strip()
+
+        # ── 白名单检查（优先于长度检查，避免误杀双字保险术语）───
+        for kw in self.INSURANCE_KEYWORDS:
+            if kw in query_lower:
+                return GuardResult(passed=True)
+
+        # ── 内部人员: 宽松检查（仅拦截明显非保险的查询）───
+        if user_role in ("agent", "underwriter", "admin"):
+            # 内部用户做宽松拦截：长度<2 且无保险关键词 + 命中黑名单才拒绝
+            if len(query_lower) < 2:
+                return GuardResult(
+                    passed=False,
+                    reason="query 过短",
+                    fallback_response=self.GREETING_RESPONSE,
+                )
+            for kw in self.BLOCK_KEYWORDS:
+                if kw in query_lower:
+                    logger.warning(f"内部用户查询命中拦截词: {kw}, query={query_lower}")
+                    return GuardResult(
+                        passed=False,
+                        reason=f"命中拦截词: {kw}",
+                        fallback_response=self.OOD_RESPONSE,
+                    )
+            # 内部用户边界情况放行（记录日志以便审计）
+            logger.debug(f"内部用户边界查询放行: {query_lower}")
+            return GuardResult(passed=True)
+
+        # ── 外部客户: 完整检查 ──
 
         # ── 太短 → 可能是闲聊 ──
         if len(query_lower) <= 2:
@@ -70,11 +94,6 @@ class DomainBoundaryGuard:
                 reason="query 过短",
                 fallback_response=self.GREETING_RESPONSE,
             )
-
-        # ── 白名单检查 ──
-        for kw in self.INSURANCE_KEYWORDS:
-            if kw in query_lower:
-                return GuardResult(passed=True)
 
         # ── 黑名单检查 ──
         for kw in self.BLOCK_KEYWORDS:

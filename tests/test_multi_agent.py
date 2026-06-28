@@ -52,7 +52,7 @@ class MockSuccessAgent(SubAgent):
             "force_handoff_triggers": [],
         }
 
-    def invoke(self, task):
+    def invoke(self, task, user_role="agent", **kwargs):
         return SubAgentResult(
             agent_name=self.name,
             task_id=task.get("task_id", "mock_task"),
@@ -83,7 +83,7 @@ class MockFailAgent(SubAgent):
             "force_handoff_triggers": [],
         }
 
-    def invoke(self, task):
+    def invoke(self, task, user_role="agent", **kwargs):
         return SubAgentResult(
             agent_name=self.name,
             task_id=task.get("task_id", "mock_task"),
@@ -334,10 +334,14 @@ class TestComplianceReview:
         self.orch = Orchestrator(agents={})
 
     def test_replaces_forbidden_phrases(self):
+        """禁止表述被 ComplianceGuard 拦截（统一合规审查）"""
+        # 旧行为: 字符串替换 "肯定可以赔"→"理赔资格需经保险公司正式审核"
+        # 新行为: ComplianceGuard 删除禁止词 + 返回 unmodified（agent 角色单条违规可修复放行）
         answer = "尊享e生肯定可以赔，您放心"
         result = self.orch._compliance_review(answer, "理赔咨询")
         assert "肯定可以赔" not in result
-        assert "审核" in result
+        # 剩余的合法文本应该保留
+        assert "尊享e生" in result
 
     def test_preserves_normal_answer(self):
         answer = "根据条款第2.5条，免赔额为1万元。最终以保险合同为准。"
@@ -429,3 +433,32 @@ class TestEndToEnd:
 if __name__ == "__main__":
     tete = TestEndToEnd()
     tete.test_multi_agent_e2e_with_mock_llm()
+
+
+# ================================================================
+# 真实 Agent invoke 路径测试 (mock LLM, 真实 SubAgent 逻辑)
+# ================================================================
+
+class RealAgentWithMockLLM(MockSuccessAgent):
+    """使用真实 SubAgent.invoke() 但 mock LLM 的 test double — 暂跳过（需完整 infra mock）"""
+    pass
+
+
+class TestRealAgentPath:
+    """测试 SubAgent.invoke() 完整链路: plan -> exec -> check -> synthesize
+
+    注意: 这些测试需要更完善的 mock 基础设施（mock StateGraph、tool 依赖等），
+    当前标记为 skip，待基础设施就绪后启用。
+    """
+
+    @pytest.mark.skip(reason="需完善 mock 基础设施: StateGraph + tool deps")
+    @patch('agent.sub_agents.base.get_llm_client')
+    def test_invoke_calls_llm_for_planning(self, mock_get_llm):
+        """invoke 时调用 LLM 生成 plan"""
+        pass
+
+    @pytest.mark.skip(reason="需完善 mock 基础设施: StateGraph + tool deps")
+    @patch('agent.sub_agents.base.get_llm_client')
+    def test_invoke_max_iterations_respected(self, mock_get_llm):
+        """max_iterations 限制实际生效"""
+        pass

@@ -221,8 +221,8 @@ class QueryClassifier:
         """
         # ── 尝试 KG 实体链接 ──
         try:
-            from rag_qa.core.kg_entity_linker import KGEntityLinker
-            linker = KGEntityLinker()
+            from rag_qa.core.kg_entity_linker import get_entity_linker
+            linker = get_entity_linker()
             kg_result = linker.link(query)
 
             entities = {}

@@ -131,8 +131,15 @@ def test_cache_modules(redis):
     query_cache.invalidate_intent("条款解读")
     print("  ✅ Query 结果缓存写入+命中+清除正常")
 
-    # 清理
-    redis.delete("faq:*", "emb:*", "result:*")
+    # 清理 — 用 SCAN + DELETE 替代无效的 glob delete
+    for pattern in ["faq:*", "emb:*", "result:*", "product:TEST-*", "test:*"]:
+        cursor = 0
+        while True:
+            cursor, keys = redis.client.scan(cursor, match=pattern, count=100)
+            if keys:
+                redis.client.delete(*keys)
+            if cursor == 0:
+                break
     print("  ✅ 测试数据已清理")
 
 

@@ -52,6 +52,22 @@ class Chunk:
     chunk_index: int = 0
     metadata: dict = field(default_factory=dict)
 
+    # ── 属性代理：从 metadata 中读取常用字段 ──
+    # KG 的 build_from_clauses() 通过属性访问 product_name 等字段，
+    # 但实际数据存储在 metadata dict 中。这些 property 确保两种访问方式兼容。
+
+    @property
+    def product_name(self) -> str:
+        return self.metadata.get("product_name", "")
+
+    @property
+    def product_code(self) -> str:
+        return self.metadata.get("product_code", "")
+
+    @property
+    def clause_type(self) -> str:
+        return self.metadata.get("clause_type", "")
+
 
 # ============================================================
 # 文档分块器

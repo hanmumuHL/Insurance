@@ -15,7 +15,7 @@ BERT-BASE-CHINESE 保险意图分类器 (LoRA 微调)
 
 使用:
   python -m rag_qa.core.bert_intent_classifier --predict "肺炎住院能赔吗"
-  python -m rag_qa.core.bert_intent_classifier --train --data rag_qa/data/seed_data.json --output models/bert_intent
+  python -m rag_qa.core.bert_intent_classifier --train --data data/seed_data.json --output models/bert_intent
 """
 
 import json

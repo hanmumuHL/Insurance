@@ -165,7 +165,7 @@ class KGReasoner:
                     product_attrs = dict(g.nodes[product_key])
                     paths.append(ReasonPath(
                         steps=[
-                            ReasonStep(node=f"disease:{original_disease}" or disease_key,
+                            ReasonStep(node=f"disease:{original_disease}" if original_disease else disease_key,
                                        node_type=NodeType.DISEASE, relation="START"),
                             ReasonStep(node=cat_key, node_type=NodeType.DISEASE_CATEGORY,
                                        relation=EdgeType.BELONGS_TO),
@@ -447,8 +447,8 @@ class KGReasoner:
 
     def parse_query(self, query: str) -> dict:
         """从自然语言解析约束条件"""
-        from rag_qa.core.kg_entity_linker import KGEntityLinker
-        linker = KGEntityLinker(self.kg)
+        from rag_qa.core.kg_entity_linker import get_entity_linker
+        linker = get_entity_linker()
         entities = linker.link(query)
 
         constraints = {
